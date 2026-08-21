@@ -37,6 +37,7 @@ export async function loadConfig(): Promise<LavalinkProxyConfig> {
         dragonfly: {
             enabled: process.env.DRAGONFLY_ENABLED !== "false",
             url: process.env.DRAGONFLY_URL || "redis://127.0.0.1:6379",
+            password: process.env.DRAGONFLY_PASSWORD || process.env.PASSWORD || "youshallnotpass",
             keyPrefix: "lavalink_proxy",
             searchTtlSeconds: 259200,
             trackTtlSeconds: 86400,

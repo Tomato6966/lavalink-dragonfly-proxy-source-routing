@@ -14,6 +14,7 @@ export const config: LavalinkProxyConfig = {
     dragonfly: {
         enabled: process.env.DRAGONFLY_ENABLED !== "false",
         url: process.env.DRAGONFLY_URL || process.env.REDIS_URL || "redis://127.0.0.1:6379",
+        password: process.env.DRAGONFLY_PASSWORD || process.env.PASSWORD || "youshallnotpass",
         keyPrefix: process.env.DRAGONFLY_KEY_PREFIX || "lavalink_proxy",
         searchTtlSeconds: Number(process.env.SEARCH_TTL || 259200),
         trackTtlSeconds: Number(process.env.TRACK_TTL || 86400),

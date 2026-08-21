@@ -51,6 +51,7 @@ export interface EventHubConfig {
 export interface DragonflyCacheConfig {
     enabled: boolean;
     url: string;
+    password?: string;
     keyPrefix: string;
     searchTtlSeconds: number;
     trackTtlSeconds: number;

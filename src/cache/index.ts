@@ -33,13 +33,20 @@ export class DragonflyCacheManager {
 
     private init(): void {
         try {
-            this.client = new Redis(this.config.url, {
+            const redisOptions: any = {
                 maxRetriesPerRequest: 2,
                 connectTimeout: 4000,
                 enableReadyCheck: true,
                 lazyConnect: false,
-                retryStrategy: (times) => Math.min(times * 200, 3000),
-            });
+                protocol: 2, // Use RESP2 to avoid NOAUTH HELLO issues on Redis/Dragonfly
+                retryStrategy: (times: number) => Math.min(times * 200, 3000),
+            };
+
+            if (this.config.password) {
+                redisOptions.password = this.config.password;
+            }
+
+            this.client = new Redis(this.config.url, redisOptions);
 
             this.client.on("connect", () => {
                 this.isConnected = true;
