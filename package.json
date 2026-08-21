@@ -1,0 +1,20 @@
+{
+  "name": "lavalink-dragonfly-proxy-source-routing",
+  "version": "1.1.0",
+  "description": "High-performance native Bun Lavalink proxy with Dragonfly caching, source remapping, and Event Hub RPC",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "example:client": "bun run examples/client-eventhub-example.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "typescript": "^5.5.4"
+  }
+}
