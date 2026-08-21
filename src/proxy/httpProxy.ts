@@ -4,6 +4,12 @@ import type { UpstreamRouter } from "../routing";
 import type { EventHubManager } from "../eventHub";
 import { buildErrorResult } from "../builders";
 
+function formatTimestamp(): string {
+    const d = new Date();
+    const pad = (n: number, z = 2) => String(n).padStart(z, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+}
+
 export class HttpProxyHandler {
     private config: LavalinkProxyConfig;
     private cache: DragonflyCacheManager;
@@ -28,8 +34,10 @@ export class HttpProxyHandler {
     }
 
     public async handleRequest(req: Request): Promise<Response> {
+        const reqStart = performance.now();
         const urlObj = new URL(req.url);
         const pathname = urlObj.pathname;
+        const ts = formatTimestamp();
 
         // 1. Stats & Health Route
         if (pathname === "/proxy/stats" || pathname === "/proxy/health") {
@@ -52,13 +60,14 @@ export class HttpProxyHandler {
             if (authHeader !== this.config.server.password) {
                 return Response.json({ error: "Unauthorized" }, { status: 401 });
             }
-            console.log("[Proxy:Cache] Cache flush requested.");
+            console.log(`[${ts}] [Proxy:Cache] Cache flush requested.`);
             return Response.json({ success: true, message: "Cache flush requested" });
         }
 
         // 3. Authenticate Lavalink Client
         const clientAuth = req.headers.get("authorization");
         if (this.config.server.password && clientAuth !== this.config.server.password) {
+            console.warn(`[${ts}] [Proxy:Auth:FAIL] Unauthorized request to ${pathname}`);
             return Response.json(
                 {
                     timestamp: Date.now(),
@@ -73,25 +82,38 @@ export class HttpProxyHandler {
 
         // 4. Handle `/v4/loadtracks` with Full Fallback Cascade & Dragonfly Cache
         if (pathname === "/v4/loadtracks" && req.method === "GET") {
-            return await this.handleLoadTracksWithCascade(req, urlObj);
+            const res = await this.handleLoadTracksWithCascade(req, urlObj, reqStart);
+            const took = (performance.now() - reqStart).toFixed(2);
+            if (this.config.logging.logRoutes) {
+                console.log(`[${formatTimestamp()}] [Proxy:HTTP] GET /v4/loadtracks -> ${res.status} (Total: ${took}ms)`);
+            }
+            return res;
         }
 
         // 5. Forward generic REST endpoints (player PATCH/POST/GET, sessions, etc.)
-        return await this.forwardGenericRequest(req, this.config.upstreams.default, urlObj);
+        const res = await this.forwardGenericRequest(req, this.config.upstreams.default, urlObj);
+        const took = (performance.now() - reqStart).toFixed(2);
+        console.log(`[${formatTimestamp()}] [Proxy:REST] ${req.method} ${pathname}${urlObj.search ? urlObj.search : ""} -> HTTP ${res.status} (Took ${took}ms)`);
+        return res;
     }
 
-    private async handleLoadTracksWithCascade(req: Request, urlObj: URL): Promise<Response> {
+    private async handleLoadTracksWithCascade(req: Request, urlObj: URL, reqStart: number): Promise<Response> {
         const rawIdentifier = urlObj.searchParams.get("identifier") || "";
+        const ts = formatTimestamp();
+
         if (!rawIdentifier) {
             return Response.json({ error: "Missing identifier parameter" }, { status: 400 });
         }
 
+        console.log(`[${ts}] [Proxy:Search:START] Query: "${rawIdentifier}"`);
+
         // 1. Direct Cache Lookup on Raw Identifier (only return valid non-empty cached data)
         const initialCached = (await this.cache.get("search", rawIdentifier)) || (await this.cache.get("track", rawIdentifier));
         if (initialCached && this.isValidLoadResult(initialCached)) {
+            const took = (performance.now() - reqStart).toFixed(2);
             if (this.config.logging.logHits) {
                 const count = Array.isArray(initialCached.data) ? ` (${initialCached.data.length} tracks)` : "";
-                console.log(`[Proxy:Cache:HIT] "${rawIdentifier}" -> ${initialCached.loadType}${count}`);
+                console.log(`[${formatTimestamp()}] [Proxy:Cache:HIT] "${rawIdentifier}" -> ${initialCached.loadType}${count} (Cache Lookup: ${took}ms)`);
             }
             return Response.json(initialCached, {
                 headers: {
@@ -110,16 +132,17 @@ export class HttpProxyHandler {
         let handlerName: string | undefined;
 
         if (preResult.isRemapped && this.config.logging.logRoutes) {
-            console.log(`[Proxy:PreRequest] Remapped "${rawIdentifier}" -> "${currentIdentifier}"`);
+            console.log(`[${formatTimestamp()}] [Proxy:PreRequest] Remapped "${rawIdentifier}" -> "${currentIdentifier}"`);
         }
 
         // Check if remapped query is in cache
         if (preResult.isRemapped) {
             const remappedCached = await this.cache.get(preResult.cacheCategory, currentIdentifier);
             if (remappedCached && this.isValidLoadResult(remappedCached)) {
+                const took = (performance.now() - reqStart).toFixed(2);
                 if (this.config.logging.logHits) {
                     const count = Array.isArray(remappedCached.data) ? ` (${remappedCached.data.length} tracks)` : "";
-                    console.log(`[Proxy:Cache:HIT] "${rawIdentifier}" (via "${currentIdentifier}") -> ${remappedCached.loadType}${count}`);
+                    console.log(`[${formatTimestamp()}] [Proxy:Cache:HIT] "${rawIdentifier}" (via "${currentIdentifier}") -> ${remappedCached.loadType}${count} (Cache Lookup: ${took}ms)`);
                 }
                 return Response.json(remappedCached, {
                     headers: {
@@ -140,12 +163,13 @@ export class HttpProxyHandler {
 
         while (attempt < maxDepth) {
             attempt++;
+            const attemptStart = performance.now();
             let attemptSuccess = false;
             let resultData: LavalinkLoadResult | null = null;
 
             if (this.config.logging.logRoutes) {
                 console.log(
-                    `[Proxy:Cascade] Attempt #${attempt}: Query="${currentIdentifier}" Target=${
+                    `[${formatTimestamp()}] [Proxy:Cascade:Attempt #${attempt}] Query="${currentIdentifier}" Target=${
                         isEventHub ? `EventHub:${handlerName}` : targetNode.id || targetNode.url
                     }`
                 );
@@ -213,16 +237,22 @@ export class HttpProxyHandler {
                         resultData = null;
                     }
 
+                    const attemptTook = (performance.now() - attemptStart).toFixed(2);
+
                     if (response.ok && resultData && this.isValidLoadResult(resultData)) {
                         attemptSuccess = true;
+                        const count = Array.isArray(resultData.data) ? ` (${resultData.data.length} tracks)` : "";
+                        console.log(`[${formatTimestamp()}] [Proxy:Upstream:OK] Received ${resultData.loadType}${count} in ${attemptTook}ms from ${targetNode.url}`);
                     } else {
                         lastErrorMsg =
                             (resultData as any)?.data?.message ||
                             (resultData as any)?.error ||
                             `HTTP ${response.status}: ${responseText.slice(0, 120)}`;
+                        console.warn(`[${formatTimestamp()}] [Proxy:Upstream:FAIL] ${targetNode.url} responded with error in ${attemptTook}ms: ${lastErrorMsg}`);
                     }
                 } catch (err: any) {
                     lastErrorMsg = `Connection failed to ${targetNode.url}: ${err.message}`;
+                    console.error(`[${formatTimestamp()}] [Proxy:Upstream:ERR] ${lastErrorMsg}`);
                 }
             }
 
@@ -235,7 +265,7 @@ export class HttpProxyHandler {
                 }
 
                 if (this.config.logging.logFallbacks && attempt > 1) {
-                    console.log(`[Proxy:Fallback:Success] Resolved "${rawIdentifier}" via attempt #${attempt} ("${currentIdentifier}")`);
+                    console.log(`[${formatTimestamp()}] [Proxy:Fallback:Success] Resolved "${rawIdentifier}" via attempt #${attempt} ("${currentIdentifier}")`);
                 }
 
                 return Response.json(resultData, {
@@ -256,14 +286,14 @@ export class HttpProxyHandler {
             const fallback = this.router.getNextFallback(currentIdentifier, lastErrorMsg, isEmpty, usedRuleNames);
             if (!fallback) {
                 if (this.config.logging.logFallbacks) {
-                    console.warn(`[Proxy:Fallback:Exhausted] No further fallback rules for "${currentIdentifier}" (Last Error: ${lastErrorMsg})`);
+                    console.warn(`[${formatTimestamp()}] [Proxy:Fallback:Exhausted] No further fallback rules for "${currentIdentifier}" (Last Error: ${lastErrorMsg})`);
                 }
                 break;
             }
 
             usedRuleNames.add(fallback.rule.name);
             if (this.config.logging.logFallbacks) {
-                console.log(`[Proxy:Fallback:Trigger] Rule "${fallback.rule.name}" triggered -> Next="${fallback.nextIdentifier}"`);
+                console.log(`[${formatTimestamp()}] [Proxy:Fallback:Trigger] Rule "${fallback.rule.name}" triggered -> Next="${fallback.nextIdentifier}"`);
             }
 
             currentIdentifier = fallback.nextIdentifier;
@@ -315,16 +345,12 @@ export class HttpProxyHandler {
                 body: reqBody,
             });
 
-            if (this.config.logging.debug) {
-                console.log(`[Proxy:REST] ${req.method} ${urlObj.pathname} -> HTTP ${response.status}`);
-            }
-
             return new Response(response.body, {
                 status: response.status,
                 headers: response.headers,
             });
         } catch (err: any) {
-            console.error(`[Proxy:Error] Forwarding ${req.method} ${urlObj.pathname} failed:`, err?.message);
+            console.error(`[${formatTimestamp()}] [Proxy:Error] Forwarding ${req.method} ${urlObj.pathname} failed:`, err?.message);
             return Response.json({ error: `Bad Gateway: ${err?.message}` }, { status: 502 });
         }
     }

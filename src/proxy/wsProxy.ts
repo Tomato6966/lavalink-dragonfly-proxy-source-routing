@@ -1,5 +1,11 @@
 import type { LavalinkProxyConfig, UpstreamNodeConfig, ProxyWebSocket } from "../types";
 
+function formatTimestamp(): string {
+    const d = new Date();
+    const pad = (n: number, z = 2) => String(n).padStart(z, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+}
+
 export class WebSocketProxyHandler {
     private config: LavalinkProxyConfig;
 
@@ -25,7 +31,7 @@ export class WebSocketProxyHandler {
             upstreamHeaders["Session-Id"] = reqHeaders["session-id"];
         }
 
-        console.log(`[Proxy:WS] Connecting to upstream Lavalink (${upstreamWsUrl})...`);
+        console.log(`[${formatTimestamp()}] [Proxy:WS] Connecting to upstream Lavalink (${upstreamWsUrl})...`);
 
         ws.data.messageQueue = [];
         ws.data.isUpstreamOpen = false;
@@ -39,7 +45,7 @@ export class WebSocketProxyHandler {
 
             upstream.onopen = () => {
                 ws.data.isUpstreamOpen = true;
-                console.log("[Proxy:WS] Upstream WebSocket connected.");
+                console.log(`[${formatTimestamp()}] [Proxy:WS] Upstream WebSocket connected.`);
                 const queue = ws.data.messageQueue || [];
                 while (queue.length > 0) {
                     const item = queue.shift();
@@ -48,35 +54,62 @@ export class WebSocketProxyHandler {
             };
 
             upstream.onmessage = (event: any) => {
-                if (this.config.logging.debug) {
-                    console.log(`[Proxy:WS:Upstream -> Client]`, event.data);
+                const ts = formatTimestamp();
+                try {
+                    const parsed = JSON.parse(event.data);
+                    if (parsed.op === "playerUpdate") {
+                        // Keep player updates quiet unless debug
+                        if (this.config.logging.debug) {
+                            console.log(`[${ts}] [Proxy:WS:Upstream -> Client] playerUpdate: guildId=${parsed.guildId} pos=${parsed.state?.position}ms`);
+                        }
+                    } else if (parsed.op === "event") {
+                        console.log(`[${ts}] [Proxy:WS:Upstream -> Client] Event: type=${parsed.type} guildId=${parsed.guildId}`);
+                    } else if (parsed.op === "ready") {
+                        console.log(`[${ts}] [Proxy:WS:Upstream -> Client] Ready: sessionId=${parsed.sessionId} resumed=${parsed.resumed}`);
+                    } else if (this.config.logging.debug) {
+                        console.log(`[${ts}] [Proxy:WS:Upstream -> Client] op=${parsed.op}`);
+                    }
+                } catch {
+                    if (this.config.logging.debug) {
+                        console.log(`[${ts}] [Proxy:WS:Upstream -> Client] raw message`);
+                    }
                 }
+
                 if (ws.readyState === 1) {
                     ws.send(event.data);
                 }
             };
 
             upstream.onclose = (event: any) => {
-                console.log(`[Proxy:WS] Upstream closed: ${event.code} - ${event.reason}`);
+                console.log(`[${formatTimestamp()}] [Proxy:WS] Upstream closed: code=${event.code} reason="${event.reason}"`);
                 if (ws.readyState === 1) {
                     ws.close(event.code, event.reason);
                 }
             };
 
             upstream.onerror = (err: any) => {
-                console.error("[Proxy:WS] Upstream error:", err?.message || err);
+                console.error(`[${formatTimestamp()}] [Proxy:WS] Upstream error:`, err?.message || err);
             };
         } catch (err: any) {
-            console.error("[Proxy:WS] Failed to connect to upstream WebSocket:", err?.message);
+            console.error(`[${formatTimestamp()}] [Proxy:WS] Failed to connect to upstream WebSocket:`, err?.message);
             ws.close(1011, "Upstream Connection Failed");
         }
     }
 
     public onMessage(ws: ProxyWebSocket, message: string | Buffer): void {
         const upstream = ws.data.upstreamWs;
-        if (this.config.logging.debug) {
-            console.log(`[Proxy:WS:Client -> Upstream]`, message);
+        const ts = formatTimestamp();
+
+        try {
+            const raw = typeof message === "string" ? message : Buffer.from(message).toString("utf-8");
+            const parsed = JSON.parse(raw);
+            console.log(`[${ts}] [Proxy:WS:Client -> Upstream] op=${parsed.op || "unknown"}`);
+        } catch {
+            if (this.config.logging.debug) {
+                console.log(`[${ts}] [Proxy:WS:Client -> Upstream] payload`);
+            }
         }
+
         if (ws.data.isUpstreamOpen && upstream && upstream.readyState === 1) {
             upstream.send(message);
         } else {
@@ -89,6 +122,6 @@ export class WebSocketProxyHandler {
         if (upstream && upstream.readyState === 1) {
             upstream.close(code, reason);
         }
-        console.log(`[Proxy:WS] Client session ended: ${code}`);
+        console.log(`[${formatTimestamp()}] [Proxy:WS] Client session ended: code=${code}`);
     }
 }
