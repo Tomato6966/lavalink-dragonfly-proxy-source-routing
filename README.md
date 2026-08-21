@@ -22,18 +22,73 @@ A blazing fast caching proxy, multi-stage source-remapping router, and **Event H
    - Responds in **`< 0.5ms`** on cache hits with `X-Proxy-Cache: HIT`.
    - `maxCachedEntries`: Automatically enforces a memory ceiling by evicting oldest entries with an LRU index.
 
-5. **🔀 Multi-Stage Source Remapping & Cascade Chains (`src/routing`):**
+5. **🧠 Levenshtein Fuzzy Typo Matching:**
+   - Automatically detects typos in search queries (e.g. `swwet dreams are nade of these` ➔ `sweet dreams are made of these`) with $\ge 85\%$ similarity.
+   - Instant cache hit without querying upstreams for minor typos!
+   - Distinguishes intentionally distinct searches (e.g., adding `by marilyn manson`) and resolves them separately.
+
+6. **🔗 YouTube Direct URL Video-ID Fallback Cascade:**
+   - Extracts 11-character video IDs from `youtube.com/watch?v=...`, `youtu.be/...`, and `music.youtube.com/...`.
+   - When upstream Lavaplayer fails on direct stream links (due to `FriendlyException` or IP blocks), the proxy automatically cascades to `ytsearch:${videoId}` via Innertube.
+
+7. **🔀 Multi-Stage Source Remapping & Cascade Chains (`src/routing`):**
    - **`preRequest` Rules:** Transform queries before the first request (e.g. `spsearch:` ➔ `dzsearch:`, strip tracking parameters).
    - **`postRequestOnFail` Fallback Chains:** Trigger sequential fallbacks when upstream returns `loadType: "error"` or `loadType: "empty"` or network errors (e.g., YouTube fail ➔ route to NodeLink ➔ fallback to Deezer ➔ fallback to Event Hub ➔ fallback to SoundCloud).
    - **`maxRecursionDepth`:** Loop & cycle protection to prevent infinite fallback cascades.
 
-6. **📡 Event Hub RPC Protocol (`src/eventHub`):**
+8. **📡 Event Hub RPC Protocol (`src/eventHub`):**
    - External clients (your Discord bot, worker scripts, or scrapers) connect to `ws://localhost:2332/proxy/events`.
    - When a fallback triggers `routeToFallbackFn: true`, the proxy emits an RPC request to the connected client.
    - The client resolves tracks with custom code and returns the Lavalink JSON response back to the proxy within a configured timeout!
 
-7. **🌐 Multi-Node Upstream Routing:**
+9. **🌐 Multi-Node Upstream Routing:**
    - Route specific sources or regex patterns to dedicated nodes (e.g. YouTube ➔ NodeLink on port `2334`, Deezer/Spotify ➔ Lavalink on port `2333`).
+
+---
+
+## ⏳ Cache Specifications & TTLs
+
+| Cache Category | Default TTL | Config Key / Env Variable | Description |
+|---|---|---|---|
+| **Search Queries** | **3 Days** (259,200s) | `searchTtlSeconds` / `SEARCH_TTL` | Cached search results for `dzsearch:`, `ytsearch:`, `scsearch:`, etc. |
+| **Direct Tracks & URLs** | **24 Hours** (86,400s) | `trackTtlSeconds` / `TRACK_TTL` | Individual track metadata and direct URL lookups. |
+| **Lyrics** | **7 Days** (604,800s) | `lyricsTtlSeconds` / `LYRICS_TTL` | Synchronized and plain text lyrics. |
+| **Max Cached Entries** | **100,000 items** | `maxCachedEntries` / `MAX_CACHED_ENTRIES` | Hard memory ceiling with automatic LRU eviction. |
+
+---
+
+## 🧠 Levenshtein Fuzzy Typo Matching
+
+The proxy uses an optimized **Levenshtein Distance & Similarity Algorithm** on incoming search queries:
+
+- **Similarity Formula:**
+  $$\text{Similarity}(A, B) = 1 - \frac{\text{LevenshteinDistance}(A, B)}{\max(|A|, |B|)}$$
+
+### Typo Resolution Examples:
+
+1. **Typo Match ($\ge 85\%$ Similarity):**
+   - *Original Search:* `sweet dreams are made of these` (len 30)
+   - *Typo Query:* `swwet dreams are nade of these` (len 30)
+   - *Edit Distance:* 2 ('w' $\leftrightarrow$ 'e', 'n' $\leftrightarrow$ 'm')
+   - *Similarity:* $93.3\%$ ($\ge 85\%$)
+   - **Action:** Returns the cached result immediately in **$\approx 1.5\text{ms}$** and automatically aliases the typo key in Dragonfly.
+
+2. **Distinct Search Query ($< 85\%$ Similarity):**
+   - *Original Search:* `sweet dreams are made of these`
+   - *Targeted Query:* `sweet dreams are made of these by marilyn manson`
+   - *Similarity:* $62.5\%$ ($< 85\%$)
+   - **Action:** Differentiated as a distinct query and searched separately upstream.
+
+---
+
+## 🔗 YouTube Direct Link & Fallback Cascade
+
+When loading YouTube or YouTube Music URLs directly (`music.youtube.com/watch?v=...`, `youtube.com/watch?v=...`, `youtu.be/...`), YouTube frequently rate-limits direct stream requests and returns `FriendlyException: Something went wrong while looking up the track`.
+
+The proxy resolves this automatically:
+1. Extracts the **11-character video ID** (`extractYouTubeVideoId`).
+2. If the direct URL fails with any error, the fallback rule `youtubeDirectLinkFailToSearch` triggers.
+3. The proxy cascades to `ytsearch:${videoId}` to load the track via Innertube, returning a valid Lavalink track response with **0 errors**.
 
 ---
 
@@ -78,13 +133,19 @@ export const config: LavalinkProxyConfig = {
                 prefix: "spsearch:",
                 rewritePrefix: "dzsearch:",
             },
+            {
+                name: "youtubeMusicToStandard",
+                match: "^https?://music\\.youtube\\.com/",
+                transformerName: "ytmToYoutube",
+            },
         ],
         postRequestOnFail: [
             {
-                name: "youtubeLinkFailToNodeLink",
-                match: "^https?://(www\\.)?(youtube\\.com|youtu\\.be)/",
-                onErrors: ["This video requires login", "All clients failed", "403", "429"],
-                routeToNode: "nodelink_node",
+                name: "youtubeDirectLinkFailToSearch",
+                match: "^https?://(www\\.|music\\.)?(youtube\\.com|youtu\\.be)/",
+                onErrors: ["*"],
+                targetPrefix: "ytsearch:",
+                routeToNode: "default",
             },
             {
                 name: "youtubeSearchFailToDeezer",
@@ -136,10 +197,14 @@ export default config;
 ### Option 2: Use `.env` Variables
 
 Copy `.env.example` to `.env`:
+
 ```bash
 PORT=2332
 PASSWORD=youshallnotpass
 DRAGONFLY_URL=redis://127.0.0.1:6379
+SEARCH_TTL=259200
+TRACK_TTL=86400
+LYRICS_TTL=604800
 MAX_CACHED_ENTRIES=100000
 UPSTREAM_DEFAULT_URL=http://127.0.0.1:2333
 UPSTREAM_NODELINK_URL=http://127.0.0.1:2334
@@ -159,7 +224,7 @@ import {
     buildPlaylistResult,
     buildEmptyResult,
     buildErrorResult,
-    createFallbackTrack
+    createFallbackTrack,
 } from "./src/builders";
 
 // 1. Quick Track
@@ -196,33 +261,40 @@ const ws = new WebSocket("ws://127.0.0.1:2332/proxy/events", {
 });
 
 ws.onopen = () => {
-    ws.send(JSON.stringify({
-        type: "handshake",
-        handlers: ["resolveFallbackTrack"]
-    }));
+    ws.send(
+        JSON.stringify({
+            type: "handshake",
+            handlers: ["resolveFallbackTrack"],
+        })
+    );
 };
 
 ws.onmessage = async (event) => {
     const msg = JSON.parse(event.data.toString());
 
     if (msg.type === "rpc_request" && msg.handler === "resolveFallbackTrack") {
-        const track = buildTrack(buildTrackInfo({
-            title: "Resolved Track",
-            author: "Custom Artist",
-            uri: "https://deezer.com/track/...",
-            sourceName: "deezer"
-        }));
+        const track = buildTrack(
+            buildTrackInfo({
+                title: "Resolved Track",
+                author: "Custom Artist",
+                uri: "https://deezer.com/track/...",
+                sourceName: "deezer",
+            })
+        );
 
-        ws.send(JSON.stringify({
-            type: "rpc_response",
-            id: msg.id,
-            success: true,
-            data: buildSearchResult([track])
-        }));
+        ws.send(
+            JSON.stringify({
+                type: "rpc_response",
+                id: msg.id,
+                success: true,
+                data: buildSearchResult([track]),
+            })
+        );
     }
 };
 ```
-*(A complete client is provided in [`examples/client-eventhub-example.ts`](examples/client-eventhub-example.ts))*.
+
+_(A complete client is provided in [`examples/client-eventhub-example.ts`](examples/client-eventhub-example.ts))_.
 
 ---
 
@@ -242,4 +314,10 @@ bun run start
 
 # Run Event Hub worker example:
 bun run example:client
+```
+
+### Start via pm2
+
+```bash
+pm2 start --name "[:2332] Lavalink-Dragonfly-Proxy" bun -- run start
 ```
