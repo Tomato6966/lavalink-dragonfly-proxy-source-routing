@@ -39,4 +39,20 @@ describe("Levenshtein & Fuzzy Search Typo Matching", () => {
         expect(id3).toBe("qeMFqkcPYcg");
         expect(id4).toBe("qeMFqkcPYcg");
     });
+
+    it("should construct valid LearnedRoute objects for fast-path short-circuiting", () => {
+        const learnedRoute = {
+            targetNodeName: "nodelink_node",
+            transformedIdentifier: "ytsearch:qeMFqkcPYcg",
+            cacheCategory: "search" as const,
+            isEventHub: false,
+            isInProcess: false,
+            learnedAt: Date.now(),
+            attemptsSaved: 2,
+        };
+
+        expect(learnedRoute.targetNodeName).toBe("nodelink_node");
+        expect(learnedRoute.transformedIdentifier).toBe("ytsearch:qeMFqkcPYcg");
+        expect(learnedRoute.attemptsSaved).toBe(2);
+    });
 });

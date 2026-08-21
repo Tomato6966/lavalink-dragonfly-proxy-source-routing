@@ -34,9 +34,21 @@ export interface PostRequestOnFailRule {
     timeoutMs?: number;
 }
 
+export interface LearnedRoute {
+    targetNodeName: string;
+    transformedIdentifier: string;
+    cacheCategory: "search" | "track" | "lyrics" | "other";
+    isEventHub: boolean;
+    isInProcess: boolean;
+    handlerName?: string;
+    learnedAt: number;
+    attemptsSaved: number;
+}
+
 export interface RemappingConfig {
     enabled: boolean;
     maxRecursionDepth: number;
+    routeLearning?: boolean;
     preRequest: PreRequestRule[];
     postRequestOnFail: PostRequestOnFailRule[];
 }

@@ -153,6 +153,23 @@ export class HttpProxyHandler {
             }
         }
 
+        // Check for a previously learned fast-path route
+        let usedLearnedFastPath = false;
+        if (this.config.remapping.routeLearning !== false) {
+            const learned = await this.cache.getLearnedRoute(rawIdentifier);
+            if (learned && (this.config.upstreams[learned.targetNodeName] || learned.isEventHub || learned.isInProcess)) {
+                currentIdentifier = learned.transformedIdentifier;
+                targetNode = this.config.upstreams[learned.targetNodeName] || targetNode;
+                isEventHub = learned.isEventHub;
+                isInProcess = learned.isInProcess;
+                handlerName = learned.handlerName;
+                usedLearnedFastPath = true;
+                if (this.config.logging.logRoutes) {
+                    console.log(`[${formatTimestamp()}] [Proxy:RouteLearner:FAST-PATH] Short-circuiting "${rawIdentifier}" -> "${currentIdentifier}" on ${targetNode.id || targetNode.url}`);
+                }
+            }
+        }
+
         // 3. Stage 2: Cascade & Fallback Execution Loop
         const maxDepth = this.config.remapping.maxRecursionDepth || 4;
         const usedRuleNames = new Set<string>();
@@ -264,6 +281,24 @@ export class HttpProxyHandler {
                     await this.cache.set(preResult.cacheCategory, rawIdentifier, resultData);
                 }
 
+                // Learn this successful route for subsequent queries to short-circuit cascades
+                if (this.config.remapping.routeLearning !== false && (attempt > 1 || preResult.isRemapped || usedLearnedFastPath)) {
+                    const targetNodeKey = Object.keys(this.config.upstreams).find(
+                        (k) => this.config.upstreams[k].url === targetNode.url
+                    ) || "default";
+
+                    await this.cache.setLearnedRoute(rawIdentifier, {
+                        targetNodeName: targetNodeKey,
+                        transformedIdentifier: currentIdentifier,
+                        cacheCategory: preResult.cacheCategory,
+                        isEventHub,
+                        isInProcess,
+                        handlerName,
+                        learnedAt: Date.now(),
+                        attemptsSaved: Math.max(1, attempt - 1),
+                    });
+                }
+
                 if (this.config.logging.logFallbacks && attempt > 1) {
                     console.log(`[${formatTimestamp()}] [Proxy:Fallback:Success] Resolved "${rawIdentifier}" via attempt #${attempt} ("${currentIdentifier}")`);
                 }
@@ -274,8 +309,21 @@ export class HttpProxyHandler {
                         "X-Proxy-Node": isEventHub ? `eventhub:${handlerName}` : targetNode.id || "upstream",
                         "X-Proxy-Attempts": String(attempt),
                         "X-Proxy-Resolved-Identifier": currentIdentifier,
+                        ...(usedLearnedFastPath ? { "X-Proxy-Learned-Route": "HIT" } : {}),
                     },
                 });
+            }
+
+            // Invalidate learned route if fast-path failed on attempt 1
+            if (usedLearnedFastPath && attempt === 1 && !attemptSuccess) {
+                console.warn(`[${formatTimestamp()}] [Proxy:RouteLearner:INVALIDATE] Learned fast-path failed for "${rawIdentifier}". Invalidating learned route and re-running cascade.`);
+                await this.cache.delLearnedRoute(rawIdentifier);
+                currentIdentifier = preResult.transformedIdentifier;
+                targetNode = preResult.targetNode;
+                isEventHub = false;
+                isInProcess = false;
+                handlerName = undefined;
+                usedLearnedFastPath = false;
             }
 
             // Record last response data

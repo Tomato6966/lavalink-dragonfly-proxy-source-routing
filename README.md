@@ -41,7 +41,12 @@ A blazing fast caching proxy, multi-stage source-remapping router, and **Event H
    - When a fallback triggers `routeToFallbackFn: true`, the proxy emits an RPC request to the connected client.
    - The client resolves tracks with custom code and returns the Lavalink JSON response back to the proxy within a configured timeout!
 
-9. **🌐 Multi-Node Upstream Routing:**
+9. **⚡ Route Learning & Fast-Path Short-Circuiting (`src/cache` & `src/routing`):**
+   - When a complex fallback cascade succeeds on Attempt $> 1$ (e.g. Attempt #1 failed on Lavalink ➔ Attempt #2 succeeded on NodeLink/Deezer), the proxy **learns the working destination**.
+   - Subsequent requests for the same query/URL **immediately short-circuit** directly to the working upstream node and transformed query on Attempt #1 in 0 wasted roundtrips!
+   - If the learned node ever fails in the future, the route is automatically invalidated and re-discovered.
+
+10. **🌐 Multi-Node Upstream Routing:**
    - Route specific sources or regex patterns to dedicated nodes (e.g. YouTube ➔ NodeLink on port `2334`, Deezer/Spotify ➔ Lavalink on port `2333`).
 
 ---

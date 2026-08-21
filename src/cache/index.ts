@@ -1,5 +1,5 @@
 import { Redis } from "ioredis";
-import type { DragonflyCacheConfig } from "../types";
+import type { DragonflyCacheConfig, LearnedRoute } from "../types";
 
 export interface CacheStats {
     hits: number;
@@ -351,6 +351,45 @@ export class DragonflyCacheManager {
         try {
             const count = await this.client.zcard(this.lruIndexKey);
             this.stats.estimatedEntries = count;
+        } catch {}
+    }
+
+    /**
+     * Get learned fast-path route for a query that previously succeeded on a fallback cascade
+     */
+    public async getLearnedRoute(rawIdentifier: string): Promise<LearnedRoute | null> {
+        if (!this.isConnected || !this.client || !this.config.enabled) return null;
+        try {
+            const key = `${this.config.keyPrefix}:learned_route:${rawIdentifier.trim().toLowerCase()}`;
+            const raw = await this.client.get(key);
+            if (!raw) return null;
+            return JSON.parse(raw);
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Save a learned fast-path route (default TTL: 7 days / 604,800s)
+     */
+    public async setLearnedRoute(rawIdentifier: string, route: LearnedRoute, ttlSeconds: number = 604800): Promise<void> {
+        if (!this.isConnected || !this.client || !this.config.enabled) return;
+        try {
+            const key = `${this.config.keyPrefix}:learned_route:${rawIdentifier.trim().toLowerCase()}`;
+            await this.client.setex(key, ttlSeconds, JSON.stringify(route));
+        } catch (err: any) {
+            console.error(`[DragonflyCache] Error saving learned route for "${rawIdentifier}":`, err?.message);
+        }
+    }
+
+    /**
+     * Delete an invalid or stale learned route
+     */
+    public async delLearnedRoute(rawIdentifier: string): Promise<void> {
+        if (!this.isConnected || !this.client || !this.config.enabled) return;
+        try {
+            const key = `${this.config.keyPrefix}:learned_route:${rawIdentifier.trim().toLowerCase()}`;
+            await this.client.del(key);
         } catch {}
     }
 }
