@@ -101,12 +101,12 @@ export class UpstreamRouter {
     /**
      * Stage 2: Post-Request On-Fail Fallback Matching
      */
-    public getNextFallback(
+    public async getNextFallback(
         currentIdentifier: string,
         lastErrorMsg: string = "",
         isEmpty: boolean = false,
         usedRuleNames: Set<string> = new Set()
-    ): FallbackResolution | null {
+    ): Promise<FallbackResolution | null> {
         if (!this.config.remapping.enabled || !Array.isArray(this.config.remapping.postRequestOnFail)) {
             return null;
         }
@@ -138,10 +138,19 @@ export class UpstreamRouter {
             // Calculate next identifier
             let nextIdentifier = currentIdentifier;
 
-            // If it's a YouTube URL and fallback has a target prefix, extract video ID
-            const ytVideoId = extractYouTubeVideoId(currentIdentifier);
+            // If it's a YouTube URL or 11-char ID and fallback has a target prefix, resolve to clean song title
+            const ytVideoId =
+                extractYouTubeVideoId(currentIdentifier) ||
+                (/^[\w-]{11}$/.test(currentIdentifier) ? currentIdentifier : null);
+
             if (ytVideoId && rule.targetPrefix) {
-                nextIdentifier = rule.targetPrefix + ytVideoId;
+                const { fetchYouTubeOEmbedTitle } = await import("../transformers");
+                const oembed = await fetchYouTubeOEmbedTitle(ytVideoId);
+                if (oembed && oembed.title) {
+                    nextIdentifier = rule.targetPrefix + oembed.title;
+                } else {
+                    nextIdentifier = rule.targetPrefix + ytVideoId;
+                }
             } else if (rule.rewritePrefix && rule.targetPrefix && nextIdentifier.startsWith(rule.rewritePrefix)) {
                 nextIdentifier = rule.targetPrefix + nextIdentifier.slice(rule.rewritePrefix.length);
             } else if (rule.targetPrefix && !nextIdentifier.startsWith(rule.targetPrefix)) {

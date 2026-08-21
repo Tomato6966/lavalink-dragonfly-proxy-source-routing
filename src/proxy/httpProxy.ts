@@ -331,7 +331,7 @@ export class HttpProxyHandler {
             const isEmpty = !resultData || resultData.loadType === "empty" || (resultData.loadType === "search" && (!Array.isArray(resultData.data) || resultData.data.length === 0));
 
             // 5. Find next matching fallback rule
-            const fallback = this.router.getNextFallback(currentIdentifier, lastErrorMsg, isEmpty, usedRuleNames);
+            const fallback = await this.router.getNextFallback(currentIdentifier, lastErrorMsg, isEmpty, usedRuleNames);
             if (!fallback) {
                 if (this.config.logging.logFallbacks) {
                     console.warn(`[${formatTimestamp()}] [Proxy:Fallback:Exhausted] No further fallback rules for "${currentIdentifier}" (Last Error: ${lastErrorMsg})`);
