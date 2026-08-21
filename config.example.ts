@@ -41,9 +41,9 @@ export const config: LavalinkProxyConfig = {
                 rewritePrefix: "dzsearch:",
             },
             {
-                name: "youtubeMusicToStandard",
-                match: "^https?://music\\.youtube\\.com/",
-                transformerName: "ytmToYoutube",
+                name: "youtubeUrlToSearch",
+                match: "^https?://(www\\.|music\\.)?(youtube\\.com|youtu\\.be)/",
+                transformerName: "youtubeUrlToSearch",
             },
         ],
         postRequestOnFail: [
