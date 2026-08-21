@@ -332,22 +332,34 @@ export class HttpProxyHandler {
     ): Promise<Response> {
         try {
             const upstreamTarget = new URL(`${targetNode.url}${urlObj.pathname}${urlObj.search}`);
-            const headers = new Headers(req.headers);
-            headers.set("authorization", targetNode.password || this.config.server.password);
-            headers.delete("host");
-            headers.delete("content-length");
+            const reqHeaders = new Headers(req.headers);
+            reqHeaders.set("authorization", targetNode.password || this.config.server.password);
+            reqHeaders.delete("host");
+            reqHeaders.delete("content-length");
+            reqHeaders.delete("connection");
+            reqHeaders.delete("transfer-encoding");
 
             const reqBody = req.method !== "GET" && req.method !== "HEAD" ? await req.arrayBuffer() : undefined;
 
             const response = await fetch(upstreamTarget.toString(), {
                 method: req.method,
-                headers,
+                headers: reqHeaders,
                 body: reqBody,
             });
 
-            return new Response(response.body, {
+            // Strip hop-by-hop and compressed encoding headers so client doesn't stall on socket timeouts
+            const resHeaders = new Headers(response.headers);
+            resHeaders.delete("content-encoding");
+            resHeaders.delete("content-length");
+            resHeaders.delete("transfer-encoding");
+            resHeaders.delete("connection");
+            resHeaders.delete("keep-alive");
+
+            const resBody = await response.arrayBuffer();
+
+            return new Response(resBody, {
                 status: response.status,
-                headers: response.headers,
+                headers: resHeaders,
             });
         } catch (err: any) {
             console.error(`[${formatTimestamp()}] [Proxy:Error] Forwarding ${req.method} ${urlObj.pathname} failed:`, err?.message);
