@@ -47,12 +47,13 @@ export class HttpProxyHandler {
         }
 
         // 2. Cache Invalidation Route
-        if (pathname === "/proxy/cache/clear" && req.method === "POST") {
-            const authHeader = req.headers.get("authorization");
+        if (pathname === "/proxy/cache/clear" && (req.method === "POST" || req.method === "GET")) {
+            const authHeader = req.headers.get("authorization") || urlObj.searchParams.get("password");
             if (authHeader !== this.config.server.password) {
                 return Response.json({ error: "Unauthorized" }, { status: 401 });
             }
-            return Response.json({ success: true, message: "Cache invalidated" });
+            console.log("[Proxy:Cache] Cache flush requested.");
+            return Response.json({ success: true, message: "Cache flush requested" });
         }
 
         // 3. Authenticate Lavalink Client
@@ -75,7 +76,7 @@ export class HttpProxyHandler {
             return await this.handleLoadTracksWithCascade(req, urlObj);
         }
 
-        // 5. Forward generic REST endpoints to default node
+        // 5. Forward generic REST endpoints (player PATCH/POST/GET, sessions, etc.)
         return await this.forwardGenericRequest(req, this.config.upstreams.default, urlObj);
     }
 
@@ -85,11 +86,12 @@ export class HttpProxyHandler {
             return Response.json({ error: "Missing identifier parameter" }, { status: 400 });
         }
 
-        // 1. Direct Cache Lookup on Raw Identifier
+        // 1. Direct Cache Lookup on Raw Identifier (only return valid non-empty cached data)
         const initialCached = (await this.cache.get("search", rawIdentifier)) || (await this.cache.get("track", rawIdentifier));
-        if (initialCached) {
+        if (initialCached && this.isValidLoadResult(initialCached)) {
             if (this.config.logging.logHits) {
-                console.log(`[Proxy:Cache:HIT] "${rawIdentifier}"`);
+                const count = Array.isArray(initialCached.data) ? ` (${initialCached.data.length} tracks)` : "";
+                console.log(`[Proxy:Cache:HIT] "${rawIdentifier}" -> ${initialCached.loadType}${count}`);
             }
             return Response.json(initialCached, {
                 headers: {
@@ -107,12 +109,17 @@ export class HttpProxyHandler {
         let isInProcess = false;
         let handlerName: string | undefined;
 
+        if (preResult.isRemapped && this.config.logging.logRoutes) {
+            console.log(`[Proxy:PreRequest] Remapped "${rawIdentifier}" -> "${currentIdentifier}"`);
+        }
+
         // Check if remapped query is in cache
         if (preResult.isRemapped) {
             const remappedCached = await this.cache.get(preResult.cacheCategory, currentIdentifier);
-            if (remappedCached) {
+            if (remappedCached && this.isValidLoadResult(remappedCached)) {
                 if (this.config.logging.logHits) {
-                    console.log(`[Proxy:Cache:HIT] "${rawIdentifier}" -> remapped "${currentIdentifier}"`);
+                    const count = Array.isArray(remappedCached.data) ? ` (${remappedCached.data.length} tracks)` : "";
+                    console.log(`[Proxy:Cache:HIT] "${rawIdentifier}" (via "${currentIdentifier}") -> ${remappedCached.loadType}${count}`);
                 }
                 return Response.json(remappedCached, {
                     headers: {
@@ -136,7 +143,7 @@ export class HttpProxyHandler {
             let attemptSuccess = false;
             let resultData: LavalinkLoadResult | null = null;
 
-            if (this.config.logging.logRoutes && attempt > 1) {
+            if (this.config.logging.logRoutes) {
                 console.log(
                     `[Proxy:Cascade] Attempt #${attempt}: Query="${currentIdentifier}" Target=${
                         isEventHub ? `EventHub:${handlerName}` : targetNode.id || targetNode.url
@@ -221,6 +228,7 @@ export class HttpProxyHandler {
 
             // 4. Evaluate Attempt Result
             if (attemptSuccess && resultData) {
+                // Save valid result in Dragonfly Cache
                 await this.cache.set(preResult.cacheCategory, currentIdentifier, resultData);
                 if (rawIdentifier !== currentIdentifier) {
                     await this.cache.set(preResult.cacheCategory, rawIdentifier, resultData);
@@ -242,7 +250,7 @@ export class HttpProxyHandler {
 
             // Record last response data
             lastResponseData = resultData;
-            const isEmpty = resultData?.loadType === "empty";
+            const isEmpty = !resultData || resultData.loadType === "empty" || (resultData.loadType === "search" && (!Array.isArray(resultData.data) || resultData.data.length === 0));
 
             // 5. Find next matching fallback rule
             const fallback = this.router.getNextFallback(currentIdentifier, lastErrorMsg, isEmpty, usedRuleNames);
@@ -278,8 +286,13 @@ export class HttpProxyHandler {
 
     private isValidLoadResult(data: any): boolean {
         if (!data || typeof data !== "object") return false;
-        const validTypes = ["track", "playlist", "search", "short"];
-        return validTypes.includes(data.loadType);
+        if (data.loadType === "track" || data.loadType === "playlist") {
+            return !!data.data;
+        }
+        if (data.loadType === "search") {
+            return Array.isArray(data.data) && data.data.length > 0;
+        }
+        return false;
     }
 
     private async forwardGenericRequest(
@@ -292,14 +305,19 @@ export class HttpProxyHandler {
             const headers = new Headers(req.headers);
             headers.set("authorization", targetNode.password || this.config.server.password);
             headers.delete("host");
+            headers.delete("content-length");
+
+            const reqBody = req.method !== "GET" && req.method !== "HEAD" ? await req.arrayBuffer() : undefined;
 
             const response = await fetch(upstreamTarget.toString(), {
                 method: req.method,
                 headers,
-                body: req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
-                // @ts-ignore
-                duplex: "half",
+                body: reqBody,
             });
+
+            if (this.config.logging.debug) {
+                console.log(`[Proxy:REST] ${req.method} ${urlObj.pathname} -> HTTP ${response.status}`);
+            }
 
             return new Response(response.body, {
                 status: response.status,

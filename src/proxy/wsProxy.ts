@@ -48,6 +48,9 @@ export class WebSocketProxyHandler {
             };
 
             upstream.onmessage = (event: any) => {
+                if (this.config.logging.debug) {
+                    console.log(`[Proxy:WS:Upstream -> Client]`, event.data);
+                }
                 if (ws.readyState === 1) {
                     ws.send(event.data);
                 }
@@ -71,7 +74,10 @@ export class WebSocketProxyHandler {
 
     public onMessage(ws: ProxyWebSocket, message: string | Buffer): void {
         const upstream = ws.data.upstreamWs;
-        if (ws.data.isUpstreamOpen && upstream && upstream.readyState === WebSocket.OPEN) {
+        if (this.config.logging.debug) {
+            console.log(`[Proxy:WS:Client -> Upstream]`, message);
+        }
+        if (ws.data.isUpstreamOpen && upstream && upstream.readyState === 1) {
             upstream.send(message);
         } else {
             ws.data.messageQueue?.push(message);
@@ -80,7 +86,7 @@ export class WebSocketProxyHandler {
 
     public onClose(ws: ProxyWebSocket, code: number, reason: string): void {
         const upstream = ws.data.upstreamWs;
-        if (upstream && upstream.readyState === WebSocket.OPEN) {
+        if (upstream && upstream.readyState === 1) {
             upstream.close(code, reason);
         }
         console.log(`[Proxy:WS] Client session ended: ${code}`);
