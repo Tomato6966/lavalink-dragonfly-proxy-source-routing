@@ -48,10 +48,11 @@ export const config: LavalinkProxyConfig = {
         ],
         postRequestOnFail: [
             {
-                name: "youtubeLinkFailToNodeLink",
-                match: "^https?://(www\\.)?(youtube\\.com|youtu\\.be)/",
-                onErrors: ["This video requires login", "All clients failed", "Sign in to confirm", "403", "429"],
-                routeToNode: "nodelink_node",
+                name: "youtubeDirectLinkFailToSearch",
+                match: "^https?://(www\\.|music\\.)?(youtube\\.com|youtu\\.be)/",
+                onErrors: ["*"],
+                targetPrefix: "ytsearch:",
+                routeToNode: "default",
             },
             {
                 name: "youtubeSearchFailToDeezer",

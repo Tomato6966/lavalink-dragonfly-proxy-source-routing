@@ -2,6 +2,32 @@ import type { LavalinkLoadResult } from "../types";
 import { buildSearchResult, buildTrack, buildTrackInfo, buildEmptyResult } from "../builders";
 
 /**
+ * Extract YouTube Video ID from any YouTube / YouTube Music URL
+ */
+export function extractYouTubeVideoId(identifier: string): string | null {
+    if (!identifier.startsWith("http://") && !identifier.startsWith("https://")) {
+        return null;
+    }
+    try {
+        const url = new URL(identifier);
+        if (url.hostname.includes("youtu.be")) {
+            const pathId = url.pathname.slice(1).split("/")[0].split("?")[0];
+            if (pathId && /^[\w-]{11}$/.test(pathId)) return pathId;
+        }
+        if (url.hostname.includes("youtube.com")) {
+            const v = url.searchParams.get("v");
+            if (v && /^[\w-]{11}$/.test(v)) return v;
+            if (url.pathname.startsWith("/shorts/") || url.pathname.startsWith("/embed/")) {
+                const parts = url.pathname.split("/");
+                const id = parts[2]?.split("?")[0];
+                if (id && /^[\w-]{11}$/.test(id)) return id;
+            }
+        }
+    } catch {}
+    return null;
+}
+
+/**
  * In-Process Transformation and Fallback Function Registry
  */
 export type QueryTransformerFn = (identifier: string, context?: Record<string, any>) => string | Promise<string>;
@@ -23,7 +49,7 @@ export class TransformerRegistry {
             try {
                 if (identifier.startsWith("http://") || identifier.startsWith("https://")) {
                     const url = new URL(identifier);
-                    const toDelete = ["si", "utm_source", "utm_medium", "utm_campaign", "feature", "fbclid", "pp"];
+                    const toDelete = ["si", "utm_source", "utm_medium", "utm_campaign", "feature", "fbclid", "pp", "list", "index"];
                     toDelete.forEach((param) => url.searchParams.delete(param));
                     return url.toString();
                 }
@@ -46,6 +72,15 @@ export class TransformerRegistry {
         this.registerQueryTransformer("ytmToYoutube", (identifier: string) => {
             if (identifier.includes("music.youtube.com/watch?v=")) {
                 return identifier.replace("music.youtube.com", "www.youtube.com");
+            }
+            return identifier;
+        });
+
+        // Convert YouTube URL to YouTube search query by videoId
+        this.registerQueryTransformer("youtubeUrlToSearch", (identifier: string) => {
+            const videoId = extractYouTubeVideoId(identifier);
+            if (videoId) {
+                return `ytsearch:${videoId}`;
             }
             return identifier;
         });

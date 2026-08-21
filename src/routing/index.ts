@@ -1,5 +1,5 @@
 import type { LavalinkProxyConfig, UpstreamNodeConfig, PreRequestRule, PostRequestOnFailRule } from "../types";
-import { TransformerRegistry } from "../transformers";
+import { TransformerRegistry, extractYouTubeVideoId } from "../transformers";
 
 export interface PreRequestResult {
     transformedIdentifier: string;
@@ -137,12 +137,19 @@ export class UpstreamRouter {
 
             // Calculate next identifier
             let nextIdentifier = currentIdentifier;
-            if (rule.rewritePrefix && rule.targetPrefix && nextIdentifier.startsWith(rule.rewritePrefix)) {
+
+            // If it's a YouTube URL and fallback has a target prefix, extract video ID
+            const ytVideoId = extractYouTubeVideoId(currentIdentifier);
+            if (ytVideoId && rule.targetPrefix) {
+                nextIdentifier = rule.targetPrefix + ytVideoId;
+            } else if (rule.rewritePrefix && rule.targetPrefix && nextIdentifier.startsWith(rule.rewritePrefix)) {
                 nextIdentifier = rule.targetPrefix + nextIdentifier.slice(rule.rewritePrefix.length);
             } else if (rule.targetPrefix && !nextIdentifier.startsWith(rule.targetPrefix)) {
                 if (nextIdentifier.includes("search:")) {
                     const queryPart = nextIdentifier.slice(nextIdentifier.indexOf(":") + 1);
                     nextIdentifier = rule.targetPrefix + queryPart;
+                } else {
+                    nextIdentifier = rule.targetPrefix + nextIdentifier;
                 }
             }
 
