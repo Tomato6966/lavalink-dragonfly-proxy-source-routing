@@ -97,6 +97,15 @@ export class TransformerRegistry {
             return identifier;
         });
 
+        // Convert YouTube URL to raw Lavalink track identifier (e.g. Fm9kbWFUXys) according to Lavalink spec
+        this.registerQueryTransformer("youtubeUrlToIdentifier", (identifier: string) => {
+            const videoId = extractYouTubeVideoId(identifier);
+            if (videoId) {
+                return videoId;
+            }
+            return identifier;
+        });
+
         // Convert YouTube URL to accurate title-based search using official YouTube oEmbed metadata
         this.registerQueryTransformer("youtubeUrlToTitleSearch", async (identifier: string) => {
             const oembed = await fetchYouTubeOEmbedTitle(identifier);
