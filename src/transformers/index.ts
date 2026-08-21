@@ -28,6 +28,27 @@ export function extractYouTubeVideoId(identifier: string): string | null {
 }
 
 /**
+ * Fetch official YouTube title via public oEmbed API (Fast, Free, No API Key needed)
+ */
+export async function fetchYouTubeOEmbedTitle(urlOrId: string): Promise<{ title: string; author: string } | null> {
+    try {
+        let videoUrl = urlOrId;
+        if (!urlOrId.startsWith("http://") && !urlOrId.startsWith("https://")) {
+            videoUrl = `https://www.youtube.com/watch?v=${urlOrId}`;
+        }
+        const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(videoUrl)}&format=json`;
+        const res = await fetch(oembedUrl, { signal: AbortSignal.timeout(1500) });
+        if (!res.ok) return null;
+        const data = (await res.json()) as any;
+        if (data.title) {
+            const cleanTitle = data.title.replace(/^@/, "").trim();
+            return { title: cleanTitle, author: data.author_name || "" };
+        }
+    } catch {}
+    return null;
+}
+
+/**
  * In-Process Transformation and Fallback Function Registry
  */
 export type QueryTransformerFn = (identifier: string, context?: Record<string, any>) => string | Promise<string>;
@@ -76,7 +97,29 @@ export class TransformerRegistry {
             return identifier;
         });
 
-        // Convert YouTube URL to YouTube search query by videoId
+        // Convert YouTube URL to accurate title-based search using official YouTube oEmbed metadata
+        this.registerQueryTransformer("youtubeUrlToTitleSearch", async (identifier: string) => {
+            const oembed = await fetchYouTubeOEmbedTitle(identifier);
+            if (oembed && oembed.title) {
+                return `ytsearch:${oembed.title}`;
+            }
+            const videoId = extractYouTubeVideoId(identifier);
+            if (videoId) {
+                return `ytsearch:${videoId}`;
+            }
+            return identifier;
+        });
+
+        // Convert YouTube URL to Deezer search by title
+        this.registerQueryTransformer("youtubeUrlToDeezerSearch", async (identifier: string) => {
+            const oembed = await fetchYouTubeOEmbedTitle(identifier);
+            if (oembed && oembed.title) {
+                return `dzsearch:${oembed.title}`;
+            }
+            return identifier;
+        });
+
+        // Convert YouTube URL to raw YouTube search query by videoId
         this.registerQueryTransformer("youtubeUrlToSearch", (identifier: string) => {
             const videoId = extractYouTubeVideoId(identifier);
             if (videoId) {

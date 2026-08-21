@@ -55,4 +55,11 @@ describe("Levenshtein & Fuzzy Search Typo Matching", () => {
         expect(learnedRoute.transformedIdentifier).toBe("ytsearch:qeMFqkcPYcg");
         expect(learnedRoute.attemptsSaved).toBe(2);
     });
+
+    it("should fetch accurate official title via YouTube oEmbed API", async () => {
+        const { fetchYouTubeOEmbedTitle } = await import("../transformers");
+        const oembed = await fetchYouTubeOEmbedTitle("https://music.youtube.com/watch?v=Fm9kbWFUXys");
+        expect(oembed).not.toBeNull();
+        expect(oembed?.title.toLowerCase()).toContain("talk a lot");
+    });
 });
