@@ -47,6 +47,33 @@ describe("cache key safety and fuzzy matching", () => {
         expect(extractYouTubeVideoId(`https://youtube.com/shorts/${id}`)).toBe(id);
     });
 
+    it("bounds L1 memory and skips oversized serialized entries", async () => {
+        const cache = new DragonflyCacheManager({
+            enabled: false,
+            url: "redis://127.0.0.1:6379",
+            keyPrefix: "test",
+            searchTtlSeconds: 60,
+            trackTtlSeconds: 60,
+            lyricsTtlSeconds: 60,
+            maxCachedEntries: 0,
+            memoryMaxEntries: 10,
+            memoryMaxBytes: 64,
+            maxEntryBytes: 64,
+            memoryTtlSeconds: 5,
+        });
+
+        await cache.set("search", "ytsearch:oversized", "x".repeat(100));
+        expect(cache.stats.oversizedSkips).toBe(1);
+        expect(cache.stats.memoryEntries).toBe(0);
+
+        await cache.set("search", "ytsearch:first", { value: "a".repeat(30) });
+        await cache.set("search", "ytsearch:second", { value: "b".repeat(30) });
+        expect(cache.stats.memoryEntries).toBeLessThanOrEqual(1);
+        expect(cache.stats.memoryBytes).toBeLessThanOrEqual(64);
+        expect(cache.stats.memoryEvictions).toBeGreaterThanOrEqual(1);
+        await cache.close();
+    });
+
     it("keeps the hot L1 cache active without a Dragonfly connection", async () => {
         const cache = new DragonflyCacheManager({
             enabled: false,

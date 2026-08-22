@@ -131,10 +131,12 @@ Default values:
 | Lyrics | 7 days |
 | Learned route | 30 minutes |
 | In-process L1 | 5 seconds / 1,000 entries |
+| In-process L1 memory cap | 32 MiB |
+| Serialized cache-entry cap | 4 MiB |
 
 Cache schema `v3` intentionally cold-starts on upgrade so older entries without encoding provenance cannot leak across playback backends. Each remote TTL gets ±5% jitter to avoid synchronized expiry. The cache is fail-open with a 750 ms command timeout and no offline command queue. Fuzzy search aliases are disabled by default because automatic typo matching can change user intent; enable them only after measuring your queries.
 
-`maxCachedEntries` provides an application-managed LRU index. For a dedicated Dragonfly deployment, prefer Dragonfly's native memory limit/cache mode and set `MAX_CACHED_ENTRIES=0` to remove the global LRU-index hot key. Keep Dragonfly close to the proxy (same host/AZ/VPC) and measure p95/p99 latency.
+`maxCachedEntries` provides an application-managed LRU index. Eviction runs in bounded background sweeps and chunks `UNLINK` calls, so a large backlog cannot create one giant command or block a request. The L1 cache is bounded by both entries and serialized bytes; results larger than `CACHE_MAX_ENTRY_BYTES` are skipped instead of retained in memory. For a dedicated Dragonfly deployment, prefer Dragonfly's native memory limit/cache mode and set `MAX_CACHED_ENTRIES=0` to remove the global LRU-index hot key. Keep Dragonfly close to the proxy (same host/AZ/VPC) and measure p95/p99 latency.
 
 Cache hits expose `X-Proxy-Cache: HIT`; coalesced waiters expose `X-Proxy-Coalesced: HIT`; learned routes expose `X-Proxy-Learned-Route: HIT`.
 

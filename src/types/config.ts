@@ -87,7 +87,10 @@ export interface DragonflyCacheConfig {
     maxCachedEntries: number; // Maximum number of entries tracked in cache (0 = unlimited)
     commandTimeoutMs?: number;
     memoryMaxEntries?: number;
+    memoryMaxBytes?: number;
     memoryTtlSeconds?: number;
+    /** Skip remote/L1 writes larger than this serialized JSON size; 0 disables the cap. */
+    maxEntryBytes?: number;
     fuzzySearchEnabled?: boolean;
     fuzzySearchThreshold?: number;
     ttlJitterPercent?: number;

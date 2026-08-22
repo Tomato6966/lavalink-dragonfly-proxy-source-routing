@@ -13,6 +13,16 @@ export interface CacheStats {
     errors: number;
     clears: number;
     estimatedEntries: number;
+    memoryEntries: number;
+    memoryBytes: number;
+    memoryEvictions: number;
+    fuzzyIndexEntries: number;
+    oversizedSkips: number;
+    maxMemoryEntries: number;
+    maxMemoryBytes: number;
+    maxFuzzyIndexEntries: number;
+    maxRemoteEntries: number;
+    remoteIndexEnabled: boolean;
 }
 
 export function calculateLevenshteinDistance(a: string, b: string): number {
@@ -84,6 +94,7 @@ interface FuzzyIndexEntry {
 interface MemoryEntry {
     value: unknown;
     expiresAt: number;
+    bytes: number;
 }
 
 export class DragonflyCacheManager {
@@ -100,14 +111,30 @@ export class DragonflyCacheManager {
         errors: 0,
         clears: 0,
         estimatedEntries: 0,
+        memoryEntries: 0,
+        memoryBytes: 0,
+        memoryEvictions: 0,
+        fuzzyIndexEntries: 0,
+        oversizedSkips: 0,
+        maxMemoryEntries: 1000,
+        maxMemoryBytes: 32 * 1024 * 1024,
+        maxFuzzyIndexEntries: 5000,
+        maxRemoteEntries: 0,
+        remoteIndexEnabled: false,
     };
     private writeCounter = 0;
     private fuzzySearchIndex: FuzzyIndexEntry[] = [];
     private readonly maxFuzzyIndexSize = 5000;
     private readonly memoryCache = new Map<string, MemoryEntry>();
+    private memoryBytes = 0;
+    private evictionInFlight = false;
 
     constructor(config: DragonflyCacheConfig) {
         this.config = config;
+        this.stats.maxMemoryEntries = config.memoryMaxEntries ?? 1000;
+        this.stats.maxMemoryBytes = config.memoryMaxBytes ?? 32 * 1024 * 1024;
+        this.stats.maxRemoteEntries = config.maxCachedEntries;
+        this.stats.remoteIndexEnabled = config.maxCachedEntries > 0;
         if (config.enabled && config.url) this.init();
     }
 
@@ -173,11 +200,25 @@ export class DragonflyCacheManager {
         return `${this.config.keyPrefix}:v3:__lru_index`;
     }
 
+    private refreshMemoryStats(): void {
+        this.stats.memoryEntries = this.memoryCache.size;
+        this.stats.memoryBytes = this.memoryBytes;
+        this.stats.fuzzyIndexEntries = this.fuzzySearchIndex.length;
+    }
+
+    private removeMemoryEntry(key: string): void {
+        const existing = this.memoryCache.get(key);
+        if (!existing) return;
+        this.memoryCache.delete(key);
+        this.memoryBytes = Math.max(0, this.memoryBytes - existing.bytes);
+    }
+
     private getMemory(key: string): unknown | null {
         const entry = this.memoryCache.get(key);
         if (!entry) return null;
         if (entry.expiresAt <= Date.now()) {
-            this.memoryCache.delete(key);
+            this.removeMemoryEntry(key);
+            this.refreshMemoryStats();
             return null;
         }
         this.memoryCache.delete(key);
@@ -185,17 +226,21 @@ export class DragonflyCacheManager {
         return entry.value;
     }
 
-    private setMemory(key: string, value: unknown, ttlSeconds: number): void {
+    private setMemory(key: string, value: unknown, ttlSeconds: number, bytes: number): void {
         const maxEntries = this.config.memoryMaxEntries ?? 1000;
-        if (maxEntries <= 0) return;
+        const maxBytes = this.config.memoryMaxBytes ?? 32 * 1024 * 1024;
+        if (maxEntries <= 0 || (maxBytes > 0 && bytes > maxBytes)) return;
         const localTtl = Math.min(ttlSeconds > 0 ? ttlSeconds : 5, this.config.memoryTtlSeconds ?? 5);
-        this.memoryCache.delete(key);
-        this.memoryCache.set(key, { value, expiresAt: Date.now() + localTtl * 1000 });
-        while (this.memoryCache.size > maxEntries) {
+        this.removeMemoryEntry(key);
+        this.memoryCache.set(key, { value, expiresAt: Date.now() + localTtl * 1000, bytes });
+        this.memoryBytes += bytes;
+        while (this.memoryCache.size > maxEntries || (maxBytes > 0 && this.memoryBytes > maxBytes)) {
             const oldest = this.memoryCache.keys().next().value as string | undefined;
             if (!oldest) break;
-            this.memoryCache.delete(oldest);
+            this.removeMemoryEntry(oldest);
+            this.stats.memoryEvictions++;
         }
+        this.refreshMemoryStats();
     }
 
     private ttlFor(subCategory: string, requested?: number): number {
@@ -226,9 +271,16 @@ export class DragonflyCacheManager {
         try {
             const raw = await this.client.get(key);
             if (raw !== null) {
+                const bytes = Buffer.byteLength(raw, "utf8");
+                const maxEntryBytes = this.config.maxEntryBytes ?? 4 * 1024 * 1024;
+                if (maxEntryBytes > 0 && bytes > maxEntryBytes) {
+                    this.stats.oversizedSkips++;
+                    this.stats.misses++;
+                    return null;
+                }
                 const value: unknown = JSON.parse(raw);
                 this.stats.hits++;
-                this.setMemory(key, value, this.config.memoryTtlSeconds ?? 5);
+                this.setMemory(key, value, this.config.memoryTtlSeconds ?? 5, bytes);
                 if (this.config.maxCachedEntries > 0) {
                     void this.client.zadd(this.lruIndexKey, Date.now(), key).catch(() => undefined);
                 }
@@ -275,6 +327,7 @@ export class DragonflyCacheManager {
         const raw = await this.client.get(this.formatKey("search", bestMatch.rawIdentifier, namespace));
         if (raw === null) {
             this.fuzzySearchIndex = this.fuzzySearchIndex.filter((entry) => entry !== bestMatch);
+            this.refreshMemoryStats();
             return null;
         }
         return JSON.parse(raw) as unknown;
@@ -289,7 +342,22 @@ export class DragonflyCacheManager {
     ): Promise<void> {
         const key = this.formatKey(subCategory, identifier, namespace);
         const ttl = this.ttlFor(subCategory, ttlSeconds);
-        this.setMemory(key, data, ttl);
+        let serialized: string | undefined;
+        try {
+            serialized = JSON.stringify(data);
+        } catch (error) {
+            this.stats.errors++;
+            console.error(`[DragonflyCache] SET serialization failed: ${error instanceof Error ? error.message : error}`);
+            return;
+        }
+        if (serialized === undefined) return;
+        const bytes = Buffer.byteLength(serialized, "utf8");
+        const maxEntryBytes = this.config.maxEntryBytes ?? 4 * 1024 * 1024;
+        if (maxEntryBytes > 0 && bytes > maxEntryBytes) {
+            this.stats.oversizedSkips++;
+            return;
+        }
+        this.setMemory(key, data, ttl, bytes);
         if (subCategory === "search" && this.config.fuzzySearchEnabled === true) {
             this.registerFuzzyEntry(identifier, namespace);
         }
@@ -297,7 +365,6 @@ export class DragonflyCacheManager {
 
         try {
             const pipeline = this.client.pipeline();
-            const serialized = JSON.stringify(data);
             if (ttl > 0) pipeline.set(key, serialized, "EX", ttl);
             else pipeline.set(key, serialized);
             if (this.config.maxCachedEntries > 0) pipeline.zadd(this.lruIndexKey, Date.now(), key);
@@ -333,14 +400,16 @@ export class DragonflyCacheManager {
         }
         this.fuzzySearchIndex.push({ namespace, prefix, cleanQuery, rawIdentifier, addedAt: Date.now() });
         if (this.fuzzySearchIndex.length > this.maxFuzzyIndexSize) this.fuzzySearchIndex.shift();
+        this.refreshMemoryStats();
     }
 
     public async del(subCategory: string, identifier: string, namespace = ""): Promise<void> {
         const key = this.formatKey(subCategory, identifier, namespace);
-        this.memoryCache.delete(key);
+        this.removeMemoryEntry(key);
         this.fuzzySearchIndex = this.fuzzySearchIndex.filter(
             (entry) => entry.rawIdentifier !== identifier || entry.namespace !== namespace
         );
+        this.refreshMemoryStats();
         if (!this.isConnected || !this.client || !this.config.enabled) return;
         try {
             const pipeline = this.client.pipeline().unlink(key);
@@ -354,7 +423,9 @@ export class DragonflyCacheManager {
 
     public async clear(): Promise<number> {
         this.memoryCache.clear();
+        this.memoryBytes = 0;
         this.fuzzySearchIndex = [];
+        this.refreshMemoryStats();
         if (!this.isConnected || !this.client || !this.config.enabled) return 0;
 
         let deleted = 0;
@@ -382,21 +453,28 @@ export class DragonflyCacheManager {
     }
 
     private async enforceMaxCachedEntries(): Promise<void> {
-        if (!this.client || !this.isConnected || this.config.maxCachedEntries <= 0) return;
+        if (this.evictionInFlight || !this.client || !this.isConnected || this.config.maxCachedEntries <= 0) return;
+        this.evictionInFlight = true;
         try {
             const total = await this.client.zcard(this.lruIndexKey);
             this.stats.estimatedEntries = total;
             const excess = total - this.config.maxCachedEntries;
             if (excess <= 0) return;
 
-            const popped = await this.client.zpopmin(this.lruIndexKey, excess);
+            // Keep each background sweep bounded; never spread tens of thousands of keys into one command.
+            const sweepLimit = Math.min(excess, 1000);
+            const popped = await this.client.zpopmin(this.lruIndexKey, sweepLimit);
             const keys = popped.filter((_, index) => index % 2 === 0);
-            if (keys.length) await this.client.unlink(...keys);
+            for (let index = 0; index < keys.length; index += 250) {
+                await this.client.unlink(...keys.slice(index, index + 250));
+            }
             this.stats.evictions += keys.length;
             this.stats.estimatedEntries = Math.max(0, total - keys.length);
         } catch (error) {
             this.stats.errors++;
             console.error(`[DragonflyCache] Eviction failed: ${error instanceof Error ? error.message : error}`);
+        } finally {
+            this.evictionInFlight = false;
         }
     }
 
