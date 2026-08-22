@@ -65,8 +65,8 @@ const OFFICIAL_EDITION_REGEX = /\b(re-?master(?:ed)?|original\s*(?:mix|version|r
 const COMPILATION_REGEX = /\b(various\s*artists?|v\/?a\b|compilation|sampler|greatest\s*hits\s*(?:of\s*)?|best\s*of\b|top\s*(?:hits|tracks)|now\s*that'?s?\s*what\s*i\s*call|hitzone|bravo\s*hits|hit\s*parade|20\s*(?:greatest|biggest)|mega\s*hits|ultra\s*hits)\b/i;
 
 /** Featuring / collaboration tags to strip for matching purposes */
-const FEAT_REGEX = /\s*[\(\[]?\s*(?:feat\.?|ft\.?|featuring|with|prod\.?\s*by|produced\s*by|&|×|x(?=\s+[A-Z]))\s+.+$/i;
-const FEAT_STRIP_REGEX = /\s*[\(\[]?\s*(?:feat\.?|ft\.?|featuring)\s+[^\)\]]+[\)\]]?/gi;
+const FEAT_REGEX = /\s*[(\[]?\s*(?:feat\.?|ft\.?|featuring|with|prod\.?\s*by|produced\s*by|&|×|x(?=\s+[A-Z]))\s+.+$/i;
+const FEAT_STRIP_REGEX = /\s*[(\[]?\s*(?:feat\.?|ft\.?|featuring)\s+[^)\]]+[)\]]?/gi;
 
 /** Common music stopwords for BM25 scoring (filtered from token significance) */
 const STOPWORDS = new Set([
@@ -96,9 +96,9 @@ function extractCoreTitle(title: string): string {
         // Remove feat/ft blocks first
         .replace(FEAT_STRIP_REGEX, "")
         // Remove known noise parentheticals  
-        .replace(/\s*[(\[{](?:official|audio|video|music\s*video|lyrics?\s*(?:video)?|hd|hq|4k|uhd|re-?master(?:ed)?|\d{4}\s*re-?master(?:ed)?|from\s*[^)\]}]+)[)\]}]/gi, "")
+        .replace(/\s*[([{](?:official|audio|video|music\s*video|lyrics?\s*(?:video)?|hd|hq|4k|uhd|re-?master(?:ed)?|\d{4}\s*re-?master(?:ed)?|from\s*[^)\]}]+)[)\]}]/gi, "")
         // Remove remaining parentheticals  
-        .replace(/\s*[(\[{][^)\]}]*[)\]}]/g, "")
+        .replace(/\s*[([{][^)\]}]*[)\]}]/g, "")
         .trim();
     return normalize(cleaned || title);
 }
@@ -107,7 +107,7 @@ function extractCoreTitle(title: string): string {
 function stripFeaturing(author: string): string {
     return author
         .replace(FEAT_REGEX, "")
-        .replace(/\s*[(\[].*[)\]]/g, "")
+        .replace(/\s*[([].*[)\]]/g, "")
         .trim();
 }
 
