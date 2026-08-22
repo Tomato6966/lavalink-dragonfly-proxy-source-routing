@@ -70,6 +70,25 @@ describe("HTTP proxy controls and coalescing", () => {
         expect((await handler.handleRequest(request("/proxy/stats"))).status).toBe(200);
     });
 
+    it("exposes an authenticated combined monitoring snapshot", async () => {
+        const { handler } = createHandler();
+        expect((await handler.handleRequest(new Request("http://proxy/proxy/monitoring"))).status).toBe(401);
+
+        const response = await handler.handleRequest(request("/proxy/monitoring"));
+        const body = await response.json() as {
+            service: string;
+            health: { status: string; cacheReady: boolean };
+            stats: { cacheConnected: boolean; configuredUpstreams: string[] };
+        };
+
+        expect(response.status).toBe(200);
+        expect(body.service).toBe("lavalink-dragonfly-proxy");
+        expect(body.health.status).toBe("ok");
+        expect(body.health.cacheReady).toBe(true);
+        expect(body.stats.cacheConnected).toBe(false);
+        expect(body.stats.configuredUpstreams).toEqual(["default"]);
+    });
+
     it("makes cache clearing an authenticated POST with real deletion", async () => {
         const { handler, getClears } = createHandler();
         expect((await handler.handleRequest(request("/proxy/cache/clear"))).status).toBe(405);
@@ -153,5 +172,95 @@ describe("HTTP proxy controls and coalescing", () => {
         expect(response.status).toBe(502);
         expect(body.data.cause).toContain("incompatible with playback scope");
         expect(getWrites()).toBe(0);
+    });
+
+    it("intercepts direct identifier in player PATCH and resolves encoded track", async () => {
+        const { handler } = createHandler();
+        let lastUpstreamBody: any = null;
+        globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            if (url.includes("/v4/loadtracks")) {
+                return Response.json({
+                    loadType: "track",
+                    data: {
+                        encoded: "resolved_direct_playable_encoded_base64_track_data",
+                        info: { title: "Test Song", author: "Artist" },
+                    },
+                });
+            }
+            if (url.includes("/players/123456")) {
+                lastUpstreamBody = JSON.parse(String(init?.body || "{}"));
+                return Response.json({ guildId: "123456", track: lastUpstreamBody.track });
+            }
+            return Response.json({});
+        }) as unknown as typeof fetch;
+
+        const response = await handler.handleRequest(request("/v4/sessions/session1/players/123456", {
+            method: "PATCH",
+            body: JSON.stringify({
+                track: {
+                    identifier: "dzsearch:Shape of You",
+                    userData: { requesterId: "987654" },
+                },
+                volume: 80,
+            }),
+        }));
+
+        expect(response.status).toBe(200);
+        expect(response.headers.get("x-proxy-direct-playback")).toBe("RESOLVED");
+        expect(lastUpstreamBody).not.toBeNull();
+        expect(lastUpstreamBody.track.encoded).toBe("resolved_direct_playable_encoded_base64_track_data");
+        expect(lastUpstreamBody.track.userData.requesterId).toBe("987654");
+    });
+
+    it("handles batch prefetch of upcoming tracks", async () => {
+        const { handler } = createHandler();
+        globalThis.fetch = (async (input: RequestInfo | URL) => {
+            const url = String(input);
+            if (url.includes("/v4/loadtracks")) {
+                return Response.json({
+                    loadType: "track",
+                    data: {
+                        encoded: "prefetched_playable_track_encoded_string_123",
+                        info: { title: "Track", author: "Artist" },
+                    },
+                });
+            }
+            return Response.json({});
+        }) as unknown as typeof fetch;
+
+        const response = await handler.handleRequest(request("/proxy/cache/prefetch", {
+            method: "POST",
+            body: JSON.stringify({
+                identifiers: ["ytsearch:song1", "ytsearch:song2"],
+            }),
+        }));
+
+        expect(response.status).toBe(200);
+        const body = await response.json() as { status: string; prefetched: number; results: any[] };
+        expect(body.status).toBe("ok");
+        expect(body.prefetched).toBe(2);
+        expect(body.results[0].status).toBe("ok");
+    });
+
+    it("handles decode tracks with cache integration", async () => {
+        const { handler } = createHandler();
+        let decodeCalls = 0;
+        globalThis.fetch = (async (input: RequestInfo | URL) => {
+            const url = String(input);
+            if (url.includes("/v4/decodetrack")) {
+                decodeCalls++;
+                return Response.json({
+                    identifier: "track_id_123",
+                    title: "Decoded Title",
+                    author: "Decoded Author",
+                });
+            }
+            return Response.json({});
+        }) as unknown as typeof fetch;
+
+        const res1 = await handler.handleRequest(request("/v4/decodetrack?encodedTrack=sample_encoded"));
+        expect(res1.status).toBe(200);
+        expect(decodeCalls).toBe(1);
     });
 });

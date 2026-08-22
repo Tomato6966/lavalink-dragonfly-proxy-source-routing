@@ -1,4 +1,4 @@
-import type { LavalinkProxyConfig, UpstreamNodeConfig, LavalinkLoadResult } from "../types";
+import type { LavalinkProxyConfig, UpstreamNodeConfig, LavalinkLoadResult, LavalinkTrack } from "../types";
 import type { DragonflyCacheManager } from "../cache";
 import { classifyIdentifier, type FallbackFailureContext, type UpstreamRouter } from "../routing";
 import type { EventHubManager } from "../eventHub";
@@ -69,31 +69,25 @@ export class HttpProxyHandler {
         const pathname = url.pathname;
 
         if (pathname === "/proxy/health") {
-            const cacheReady = !this.config.dragonfly.enabled || this.cache.isConnected;
-            return Response.json({
-                status: cacheReady ? "ok" : "degraded",
-                ready: true,
-                cacheReady,
-                uptimeSeconds: Math.floor((Date.now() - this.startTime) / 1000),
-            });
+            return Response.json(this.healthSnapshot());
         }
 
         const unauthorized = this.authenticate(req, pathname);
         if (unauthorized) return unauthorized;
 
         if (pathname === "/proxy/stats") {
+            return Response.json(this.statsSnapshot());
+        }
+
+        if (pathname === "/proxy/monitoring") {
+            if (req.method !== "GET") {
+                return Response.json({ error: "Method Not Allowed" }, { status: 405, headers: { Allow: "GET" } });
+            }
             return Response.json({
-                status: "ok",
-                runtime: "Bun",
-                uptimeSeconds: Math.floor((Date.now() - this.startTime) / 1000),
-                cacheConnected: this.cache.isConnected,
-                cacheStats: this.cache.stats,
-                proxyStats: this.runtimeStats,
-                inFlightLoadRequests: this.inFlightLoads.size,
-                connectedEventHubClients: this.eventHub.connectedClientCount,
-                configuredUpstreams: Object.keys(this.config.upstreams),
-                circuitBreakers: this.circuitSnapshot(),
-                remappingEnabled: this.config.remapping.enabled,
+                service: "lavalink-dragonfly-proxy",
+                timestamp: Date.now(),
+                health: this.healthSnapshot(),
+                stats: this.statsSnapshot(),
             });
         }
 
@@ -110,12 +104,60 @@ export class HttpProxyHandler {
             return this.toResponse(result);
         }
 
+        if ((pathname === "/proxy/cache/prefetch" || pathname === "/v4/loadtracks/prefetch") && req.method === "POST") {
+            return this.handlePrefetch(req, requestStartedAt);
+        }
+
+        if (pathname === "/v4/decodetrack" && req.method === "GET") {
+            return this.handleDecodeTrack(req, url);
+        }
+
+        if (pathname === "/v4/decodetracks" && req.method === "POST") {
+            return this.handleDecodeTracks(req, url);
+        }
+
+        const isPlayerUpdate = req.method === "PATCH" && /^\/v4\/sessions\/[^/]+\/players\/[^/]+$/.test(pathname);
+        if (isPlayerUpdate) {
+            const response = await this.handlePlayerUpdate(req, url, requestStartedAt);
+            if (this.config.logging.logRoutes) {
+                const took = (performance.now() - requestStartedAt).toFixed(2);
+                console.log(`[${formatTimestamp()}] [Proxy:Player:PATCH] ${pathname} -> ${response.status} (${took}ms)`);
+            }
+            return response;
+        }
+
         const response = await this.forwardGenericRequest(req, this.config.upstreams.default, url);
         if (this.config.logging.logRoutes) {
             const took = (performance.now() - requestStartedAt).toFixed(2);
             console.log(`[${formatTimestamp()}] [Proxy:REST] ${req.method} ${pathname} -> ${response.status} (${took}ms)`);
         }
         return response;
+    }
+
+    private healthSnapshot() {
+        const cacheReady = !this.config.dragonfly.enabled || this.cache.isConnected;
+        return {
+            status: cacheReady ? "ok" : "degraded",
+            ready: true,
+            cacheReady,
+            uptimeSeconds: Math.floor((Date.now() - this.startTime) / 1000),
+        };
+    }
+
+    private statsSnapshot() {
+        return {
+            status: "ok",
+            runtime: "Bun",
+            uptimeSeconds: Math.floor((Date.now() - this.startTime) / 1000),
+            cacheConnected: this.cache.isConnected,
+            cacheStats: this.cache.stats,
+            proxyStats: this.runtimeStats,
+            inFlightLoadRequests: this.inFlightLoads.size,
+            connectedEventHubClients: this.eventHub.connectedClientCount,
+            configuredUpstreams: Object.keys(this.config.upstreams),
+            circuitBreakers: this.circuitSnapshot(),
+            remappingEnabled: this.config.remapping.enabled,
+        };
     }
 
     private authenticate(req: Request, pathname: string): Response | null {
@@ -159,6 +201,284 @@ export class HttpProxyHandler {
             return await promise;
         } finally {
             if (this.inFlightLoads.get(cacheKey) === promise) this.inFlightLoads.delete(cacheKey);
+        }
+    }
+
+    private async handlePrefetch(req: Request, requestStartedAt: number): Promise<Response> {
+        let body: any;
+        try {
+            body = await req.json();
+        } catch {
+            return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+        }
+        const rawList = Array.isArray(body?.identifiers)
+            ? body.identifiers
+            : typeof body?.identifier === "string"
+                ? [body.identifier]
+                : [];
+        if (rawList.length === 0) {
+            return Response.json({ error: "No identifiers provided for prefetch" }, { status: 400 });
+        }
+        const limit = Math.min(rawList.length, 50);
+        const batch = rawList.slice(0, limit);
+        const results = await Promise.all(
+            batch.map(async (identifier: unknown) => {
+                const trimmed = String(identifier || "").trim();
+                if (!trimmed) return { identifier: trimmed, status: "skipped", cached: false };
+                try {
+                    const dummyUrl = new URL(`http://proxy/v4/loadtracks?identifier=${encodeURIComponent(trimmed)}`);
+                    const dummyReq = new Request(dummyUrl, { headers: { authorization: this.config.server.password || "" } });
+                    const res = await this.handleCoalescedLoad(dummyReq, dummyUrl, requestStartedAt);
+                    return {
+                        identifier: trimmed,
+                        status: res.status === 200 ? "ok" : "error",
+                        loadType: (res.data as any)?.loadType,
+                        cached: res.headers?.["X-Proxy-Cache"] === "HIT",
+                    };
+                } catch (err) {
+                    return { identifier: trimmed, status: "error", error: String(err), cached: false };
+                }
+            })
+        );
+        return Response.json({
+            status: "ok",
+            prefetched: results.length,
+            results,
+        });
+    }
+
+    private async handleDecodeTrack(req: Request, url: URL): Promise<Response> {
+        const encodedTrack = url.searchParams.get("encodedTrack")?.trim();
+        if (encodedTrack) {
+            const cached = await this.cache.get("decoded", encodedTrack);
+            if (cached) {
+                return Response.json(cached, {
+                    headers: { "X-Proxy-Cache": "HIT", "X-Proxy-Node": "cache" },
+                });
+            }
+        }
+        const response = await this.forwardGenericRequest(req, this.config.upstreams.default, url);
+        if (response.ok && encodedTrack) {
+            try {
+                const cloned = response.clone();
+                const json = await cloned.json();
+                void this.cache.set("decoded", encodedTrack, json, this.config.dragonfly.trackTtlSeconds);
+            } catch {
+                // Ignore parse errors on decode caching
+            }
+        }
+        return response;
+    }
+
+    private async handleDecodeTracks(req: Request, url: URL): Promise<Response> {
+        let rawTracks: string[] = [];
+        try {
+            const body = await req.json();
+            if (Array.isArray(body)) rawTracks = body;
+        } catch {
+            return Response.json({ error: "Invalid JSON array" }, { status: 400 });
+        }
+
+        if (rawTracks.length === 0) return Response.json([]);
+
+        const results = Array.from<any>({ length: rawTracks.length });
+        const missIndexes: number[] = [];
+        const missTracks: string[] = [];
+
+        await Promise.all(
+            rawTracks.map(async (encodedTrack, index) => {
+                if (typeof encodedTrack !== "string" || !encodedTrack) return;
+                const cached = await this.cache.get("decoded", encodedTrack);
+                if (cached) {
+                    results[index] = cached;
+                } else {
+                    missIndexes.push(index);
+                    missTracks.push(encodedTrack);
+                }
+            })
+        );
+
+        if (missTracks.length === 0) {
+            return Response.json(results, { headers: { "X-Proxy-Cache": "HIT" } });
+        }
+
+        try {
+            const upstreamTarget = this.createUpstreamUrl(this.config.upstreams.default, "/v4/decodetracks");
+            const headers = new Headers(req.headers);
+            headers.set("authorization", this.config.upstreams.default.password || this.config.server.password);
+            headers.set("content-type", "application/json");
+
+            const response = await fetch(upstreamTarget, {
+                method: "POST",
+                headers,
+                body: JSON.stringify(missTracks),
+                signal: AbortSignal.timeout(this.config.server.upstreamRequestTimeoutMs ?? 5000),
+            });
+
+            if (response.ok) {
+                const upstreamResults = (await response.json()) as any[];
+                if (Array.isArray(upstreamResults)) {
+                    for (let i = 0; i < missIndexes.length; i++) {
+                        const originalIndex = missIndexes[i];
+                        const trackData = upstreamResults[i];
+                        if (trackData) {
+                            results[originalIndex] = trackData;
+                            void this.cache.set("decoded", missTracks[i], trackData, this.config.dragonfly.trackTtlSeconds);
+                        }
+                    }
+                }
+                return Response.json(results, {
+                    headers: { "X-Proxy-Cache": missIndexes.length < rawTracks.length ? "PARTIAL" : "MISS" },
+                });
+            }
+        } catch (error) {
+            console.error(`[${formatTimestamp()}] [Proxy:DecodeTracks:ERR] ${error instanceof Error ? error.message : error}`);
+        }
+
+        return this.forwardGenericRequest(req, this.config.upstreams.default, url);
+    }
+
+    private extractPlayableTrack(loadResult: LavalinkLoadResult): LavalinkTrack | null {
+        if (!loadResult) return null;
+        if (loadResult.loadType === "track") {
+            return loadResult.data?.encoded ? loadResult.data : null;
+        }
+        if (loadResult.loadType === "search") {
+            return Array.isArray(loadResult.data) && loadResult.data.length > 0 && loadResult.data[0].encoded
+                ? loadResult.data[0]
+                : null;
+        }
+        if (loadResult.loadType === "playlist") {
+            return loadResult.data?.tracks?.length > 0 && loadResult.data.tracks[0].encoded
+                ? loadResult.data.tracks[0]
+                : null;
+        }
+        return null;
+    }
+
+    private async resolveTrackForDirectPlayback(
+        rawIdentifier: string,
+        requestStartedAt: number
+    ): Promise<{ result: LavalinkLoadResult | null; cacheStatus: "HIT" | "MISS"; httpStatus: number }> {
+        const dummyUrl = new URL(`http://proxy/v4/loadtracks?identifier=${encodeURIComponent(rawIdentifier)}`);
+        const dummyReq = new Request(dummyUrl, {
+            headers: { authorization: this.config.server.password || "" },
+        });
+        const loadResult = await this.handleCoalescedLoad(dummyReq, dummyUrl, requestStartedAt);
+        const data = loadResult.data as LavalinkLoadResult;
+        const cacheHit = loadResult.headers?.["X-Proxy-Cache"] === "HIT";
+        return {
+            result: isLavalinkLoadResult(data) ? data : null,
+            cacheStatus: cacheHit ? "HIT" : "MISS",
+            httpStatus: loadResult.status,
+        };
+    }
+
+    private async handlePlayerUpdate(req: Request, url: URL, requestStartedAt: number): Promise<Response> {
+        let bodyText = "";
+        try {
+            bodyText = await req.text();
+        } catch {
+            return Response.json({ error: "Failed to read request body" }, { status: 400 });
+        }
+
+        if (!bodyText || bodyText.trim() === "") {
+            return this.forwardWithBody(req, this.config.upstreams.default, url, bodyText);
+        }
+
+        let body: Record<string, any>;
+        try {
+            body = JSON.parse(bodyText);
+        } catch {
+            return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+        }
+
+        let cacheStatus: "HIT" | "MISS" | "BYPASS" = "BYPASS";
+        let resolvedTrackEncoded: string | null = null;
+
+        if (body?.track && typeof body.track === "object") {
+            const hasEncoded = typeof body.track.encoded === "string" && body.track.encoded.trim() !== "";
+            const identifier = typeof body.track.identifier === "string" ? body.track.identifier.trim() : "";
+
+            if (!hasEncoded && identifier) {
+                const loadResult = await this.resolveTrackForDirectPlayback(identifier, requestStartedAt);
+                if (loadResult.result) {
+                    const playableTrack = this.extractPlayableTrack(loadResult.result);
+                    if (playableTrack) {
+                        resolvedTrackEncoded = playableTrack.encoded;
+                        body.track.encoded = playableTrack.encoded;
+                        cacheStatus = loadResult.cacheStatus;
+                        if (!body.track.userData && playableTrack.userData) {
+                            body.track.userData = playableTrack.userData;
+                        }
+                    } else {
+                        return Response.json({
+                            timestamp: Date.now(),
+                            status: 404,
+                            error: "Not Found",
+                            message: `Direct playback resolving returned no playable tracks for identifier: ${identifier}`,
+                            path: url.pathname,
+                        }, { status: 404 });
+                    }
+                } else {
+                    return Response.json({
+                        timestamp: Date.now(),
+                        status: loadResult.httpStatus || 502,
+                        error: "Bad Gateway",
+                        message: `Direct playback resolving failed for identifier: ${identifier}`,
+                        path: url.pathname,
+                    }, { status: loadResult.httpStatus || 502 });
+                }
+            }
+        }
+
+        const serialized = JSON.stringify(body);
+        const upstreamResponse = await this.forwardWithBody(req, this.config.upstreams.default, url, serialized);
+
+        if (resolvedTrackEncoded) {
+            const headers = new Headers(upstreamResponse.headers);
+            headers.set("X-Proxy-Direct-Playback", "RESOLVED");
+            headers.set("X-Proxy-Cache", cacheStatus);
+            return new Response(upstreamResponse.body, {
+                status: upstreamResponse.status,
+                headers,
+            });
+        }
+
+        return upstreamResponse;
+    }
+
+    private async forwardWithBody(
+        req: Request,
+        targetNode: UpstreamNodeConfig,
+        url: URL,
+        bodyText: string
+    ): Promise<Response> {
+        try {
+            const upstreamTarget = this.createUpstreamUrl(targetNode, url.pathname, url.search);
+            const headers = new Headers(req.headers);
+            headers.set("authorization", targetNode.password || this.config.server.password);
+            headers.set("accept-encoding", "identity");
+            for (const header of ["host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"]) {
+                headers.delete(header);
+            }
+
+            const response = await fetch(upstreamTarget, {
+                method: req.method,
+                headers,
+                body: bodyText,
+                signal: AbortSignal.timeout(targetNode.requestTimeoutMs ?? this.config.server.upstreamRequestTimeoutMs ?? 10_000),
+            });
+
+            const responseHeaders = new Headers(response.headers);
+            for (const header of ["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"]) {
+                responseHeaders.delete(header);
+            }
+            return new Response(response.body, { status: response.status, headers: responseHeaders });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(`[${formatTimestamp()}] [Proxy:REST:ERR] ${req.method} ${url.pathname}: ${message}`);
+            return Response.json({ error: `Bad Gateway: ${message}` }, { status: 502 });
         }
     }
 

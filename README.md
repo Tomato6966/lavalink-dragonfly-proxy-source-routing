@@ -156,6 +156,7 @@ Do not return `CUSTOM_TRACK_ENCODED` or metadata-only synthetic tracks. The v2 b
 |---|---|---|
 | `GET /proxy/health` | Public/minimal | Process/cache readiness |
 | `GET /proxy/stats` | Lavalink password | Cache, breaker, RPC, and coalescing stats |
+| `GET /proxy/monitoring` | Lavalink password | Combined health and operational snapshot for admin dashboards |
 | `POST /proxy/cache/clear` | Lavalink password | SCAN/UNLINK this proxy namespace |
 | `/v4/*` | Lavalink password | Proxied Lavalink/NodeLink API |
 | `/v4/websocket` | Lavalink password | Default backend session tunnel |
