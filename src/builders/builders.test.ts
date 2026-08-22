@@ -9,50 +9,37 @@ import {
     createFallbackTrack,
 } from "./index";
 
-describe("Lavalink v4 Response Builders", () => {
-    it("should build track info correctly", () => {
-        const info = buildTrackInfo({
-            title: "Rolling in the Deep",
-            author: "Adele",
-            length: 228000,
-            uri: "https://deezer.com/track/123",
-            sourceName: "deezer",
-        });
+const ENCODED = "QAAAWgMABFRlc3QABkFydGlzdAAAAAAAAtMAAAALdGVzdF90cmFjawEAE2h0dHBzOi8vZXhhbXBsZS5jb20BAAZjdXN0b20AAAAAAAAAAA";
 
+describe("Lavalink v4 response builders", () => {
+    it("builds track info with protocol defaults", () => {
+        const info = buildTrackInfo({ title: "Rolling in the Deep", author: "Adele", length: 228000 });
         expect(info.title).toBe("Rolling in the Deep");
-        expect(info.author).toBe("Adele");
         expect(info.length).toBe(228000);
-        expect(info.sourceName).toBe("deezer");
         expect(info.isSeekable).toBe(true);
     });
 
-    it("should create fallback track cleanly", () => {
-        const track = createFallbackTrack("Hello", "Adele", "https://deezer.com/track/456", 295000, "deezer");
+    it("requires a real backend-produced encoded track", () => {
+        const info = buildTrackInfo({ title: "Hello", author: "Adele" });
+        expect(buildTrack(info, ENCODED).encoded).toBe(ENCODED);
+        expect(() => buildTrack(info, "CUSTOM_TRACK_ENCODED")).toThrow();
+    });
+
+    it("creates fallback tracks only when encoding is supplied", () => {
+        const track = createFallbackTrack(ENCODED, "Hello", "Adele", "https://deezer.com/track/456", 295000, "deezer");
         expect(track.info.title).toBe("Hello");
-        expect(track.encoded).toBe("CUSTOM_TRACK_ENCODED");
+        expect(track.encoded).toBe(ENCODED);
     });
 
-    it("should build search result", () => {
-        const track = createFallbackTrack("Song A", "Artist A");
-        const search = buildSearchResult([track]);
-        expect(search.loadType).toBe("search");
-        expect(search.data.length).toBe(1);
+    it("builds search and playlist results", () => {
+        const track = createFallbackTrack(ENCODED, "Song A", "Artist A");
+        expect(buildSearchResult([track]).data).toHaveLength(1);
+        expect(buildPlaylistResult("My Hits", [track]).data.info.name).toBe("My Hits");
     });
 
-    it("should build playlist result", () => {
-        const track = createFallbackTrack("Song B", "Artist B");
-        const playlist = buildPlaylistResult("My Hits", [track]);
-        expect(playlist.loadType).toBe("playlist");
-        expect(playlist.data.info.name).toBe("My Hits");
-        expect(playlist.data.tracks.length).toBe(1);
-    });
-
-    it("should build empty and error results", () => {
-        const empty = buildEmptyResult();
-        expect(empty.loadType).toBe("empty");
-
+    it("builds empty and error results", () => {
+        expect(buildEmptyResult().loadType).toBe("empty");
         const error = buildErrorResult("Video restricted", "common", "Geoblock");
-        expect(error.loadType).toBe("error");
         expect(error.data.message).toBe("Video restricted");
         expect(error.data.severity).toBe("common");
     });

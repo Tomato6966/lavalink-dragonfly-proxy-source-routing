@@ -1,328 +1,198 @@
-# Lavalink Dragonfly Proxy, Source Router & Event Hub (100% Native Bun)
+# Lavalink Dragonfly Proxy & Source Router
 
-A blazing fast caching proxy, multi-stage source-remapping router, and **Event Hub RPC engine** built on **100% Native Bun (`Bun.serve`)** for **Lavalink v4** and **NodeLink**.
+A low-latency, drop-in Lavalink v4 proxy built on `Bun.serve`. It keeps the client-facing Lavalink REST/WebSocket contract, caches load results in a small in-process LRU plus Dragonfly/Redis, learns successful fallback routes, and recovers failed searches through ordered backend and metadata-resolver strategies.
 
----
+The proxy is designed for Lavalink v4 and NodeLink-compatible backends. It is not an audio source implementation.
 
-## 🌟 Key Features
+## The compatibility rule that matters
 
-1. **⚡ 100% Native Bun Architecture (`Bun.serve`):**
-   - Built on Bun's internal uWebSockets and native zero-copy HTTP streaming engine.
-   - Ultra-low memory footprint, sub-millisecond response latency, and managed with `bun.lock`.
+A Lavalink track's `encoded` value is backend/source-manager state, not metadata. A title, artist, Spotify URL, Deezer record, or YouTube result cannot be turned into a playable track by inventing an encoded string.
 
-2. **⚙️ Type-Safe `config.ts` & `.env` Support:**
-   - Full TypeScript auto-completion for all settings.
-   - Reads environment variables dynamically from `.env` files.
+This project therefore follows three rules:
 
-3. **🛠️ Lavalink v4 Response Builders (`src/builders`):**
-   - Type-safe, memory-efficient constructors for tracks, playlists, search results, and safe errors.
+1. Local packages only canonicalize metadata or recover a new identifier.
+2. The recovered identifier is loaded by a real Lavalink/NodeLink backend.
+3. Event Hub workers must return a real load result whose encoded tracks came from a compatible backend.
 
-4. **⚡ Dragonfly / Redis Cache & LRU Auto-Eviction (`src/cache`):**
-   - Caches `/v4/loadtracks?identifier=...` searches and track lookups in Dragonfly/Redis.
-   - Responds in **`< 0.5ms`** on cache hits with `X-Proxy-Cache: HIT`.
-   - `maxCachedEntries`: Automatically enforces a memory ceiling by evicting oldest entries with an LRU index.
+Keep the backend that loads a track compatible with the backend that plays it. The safest setup uses one default playback backend and its own plugins/source managers for all final encoding. To use NodeLink as the player, configure it as `upstreams.default`; do not casually mix NodeLink-produced encodings into a Lavalink playback session.
 
-5. **🧠 Levenshtein Fuzzy Typo Matching:**
-   - Automatically detects typos in search queries (e.g. `swwet dreams are nade of these` ➔ `sweet dreams are made of these`) with $\ge 85\%$ similarity.
-   - Instant cache hit without querying upstreams for minor typos!
-   - Distinguishes intentionally distinct searches (e.g., adding `by marilyn manson`) and resolves them separately.
+The proxy enforces this with `encodingScope`. A successful fallback is returned or cached only when its scope matches `upstreams.default.encodingScope`; Event Hub and in-process fallback rules must explicitly declare the scope of their worker/backend. Cache and learned-route keys are also scope-namespaced. If you keep an ignored custom `config.ts`, add `encodingScope` to those rules before upgrading.
 
-6. **🔗 YouTube Direct URL Video-ID Fallback Cascade:**
-   - Extracts 11-character video IDs from `youtube.com/watch?v=...`, `youtu.be/...`, and `music.youtube.com/...`.
-   - When upstream Lavaplayer fails on direct stream links (due to `FriendlyException` or IP blocks), the proxy automatically cascades to `ytsearch:${videoId}` via Innertube.
+See the official [Lavalink REST API](https://lavalink.dev/api/rest), [WebSocket API](https://lavalink.dev/api/websocket), [NodeLink differences](https://nodelink.js.org/docs/differences), [LavaSrc](https://github.com/topi314/LavaSrc), and the official [Lavalink YouTube source plugin](https://github.com/lavalink-devs/youtube-source).
 
-7. **🔀 Multi-Stage Source Remapping & Cascade Chains (`src/routing`):**
-   - **`preRequest` Rules:** Transform queries before the first request (e.g. `spsearch:` ➔ `dzsearch:`, strip tracking parameters).
-   - **`postRequestOnFail` Fallback Chains:** Trigger sequential fallbacks when upstream returns `loadType: "error"` or `loadType: "empty"` or network errors (e.g., YouTube fail ➔ route to NodeLink ➔ fallback to Deezer ➔ fallback to Event Hub ➔ fallback to SoundCloud).
-   - **`maxRecursionDepth`:** Loop & cycle protection to prevent infinite fallback cascades.
+## What v2 adds
 
-8. **📡 Event Hub RPC Protocol (`src/eventHub`):**
-   - External clients (your Discord bot, worker scripts, or scrapers) connect to `ws://localhost:2332/proxy/events`.
-   - When a fallback triggers `routeToFallbackFn: true`, the proxy emits an RPC request to the connected client.
-   - The client resolves tracks with custom code and returns the Lavalink JSON response back to the proxy within a configured timeout!
+- Case-safe, SHA-256-bounded cache keys. Case-sensitive YouTube/Spotify IDs no longer collide.
+- A hot in-process L1 cache in front of Dragonfly.
+- Per-process single-flight request coalescing for identical `/v4/loadtracks` misses.
+- Pipelined Dragonfly writes, TTL jitter, real namespace clearing, learned-route expiry, playback-scope isolation, and optional fuzzy matching (off by default).
+- Composable pre-request rules. Global URL cleanup, prefix rewrites, transformers, and node selection can all run in order.
+- Structured fallback conditions for `empty`, `error`, HTTP status, and error-message matching.
+- Per-rule timeouts, upstream deadlines, response-size limits, in-flight limits, and per-node circuit breakers.
+- Streaming generic REST forwarding instead of buffering entire bodies.
+- Bounded WebSocket queues and Bun backpressure limits.
+- Event Hub responses bound to the worker that received the RPC, cleanup on disconnect, and least-loaded worker selection.
+- Guarded Spotify track/episode recovery through `spotify-url-info` and case-safe parsing through `spotify-uri`.
+- A bounded `@distube/ytsr` last resort that returns a YouTube URL to the backend; it never exposes/caches signed stream URLs.
+- Reproducible non-root Docker packaging and deterministic tests with no live-network dependency.
 
-9. **⚡ Route Learning & Fast-Path Short-Circuiting (`src/cache` & `src/routing`):**
-   - When a complex fallback cascade succeeds on Attempt $> 1$ (e.g. Attempt #1 failed on Lavalink ➔ Attempt #2 succeeded on NodeLink/Deezer), the proxy **learns the working destination**.
-   - Subsequent requests for the same query/URL **immediately short-circuit** directly to the working upstream node and transformed query on Attempt #1 in 0 wasted roundtrips!
-   - If the learned node ever fails in the future, the route is automatically invalidated and re-discovered.
+## Quick start
 
-10. **🌐 Multi-Node Upstream Routing:**
-   - Route specific sources or regex patterns to dedicated nodes (e.g. YouTube ➔ NodeLink on port `2334`, Deezer/Spotify ➔ Lavalink on port `2333`).
+Requirements:
 
----
+- Bun 1.3+
+- Lavalink v4 or a NodeLink-compatible backend
+- Dragonfly/Redis (optional; the proxy fails open without it)
 
-## ⏳ Cache Specifications & TTLs
+```bash
+bun install --frozen-lockfile
 
-| Cache Category | Default TTL | Config Key / Env Variable | Description |
-|---|---|---|---|
-| **Search Queries** | **3 Days** (259,200s) | `searchTtlSeconds` / `SEARCH_TTL` | Cached search results for `dzsearch:`, `ytsearch:`, `scsearch:`, etc. |
-| **Direct Tracks & URLs** | **24 Hours** (86,400s) | `trackTtlSeconds` / `TRACK_TTL` | Individual track metadata and direct URL lookups. |
-| **Lyrics** | **7 Days** (604,800s) | `lyricsTtlSeconds` / `LYRICS_TTL` | Synchronized and plain text lyrics. |
-| **Max Cached Entries** | **100,000 items** | `maxCachedEntries` / `MAX_CACHED_ENTRIES` | Hard memory ceiling with automatic LRU eviction. |
+# Minimal local configuration
+export PASSWORD='replace-with-a-long-random-secret'
+export UPSTREAM_DEFAULT_PASSWORD='your-lavalink-password'
+export UPSTREAM_DEFAULT_URL='http://127.0.0.1:2333'
+export UPSTREAM_DEFAULT_WS_URL='ws://127.0.0.1:2333/v4/websocket'
 
----
+bun run check
+bun run start
+```
 
-## 🧠 Levenshtein Fuzzy Typo Matching
+Bun automatically reads a local `.env`. Both `.env` and `config.ts` are intentionally ignored so deployment secrets stay outside Git. Copy `config.example.ts` to `config.ts` when you need a fully typed routing policy.
 
-The proxy uses an optimized **Levenshtein Distance & Similarity Algorithm** on incoming search queries:
+The safe listener default is `127.0.0.1:2332`. Set `HOST=0.0.0.0` only behind an authenticated/private network or reverse proxy and replace the default password first.
 
-- **Similarity Formula:**
-  $$\text{Similarity}(A, B) = 1 - \frac{\text{LevenshteinDistance}(A, B)}{\max(|A|, |B|)}$$
+## Default fallback policy
 
-### Typo Resolution Examples:
+The tracked example always tries the original identifier on the real backend first. It only remaps after a failure:
 
-1. **Typo Match ($\ge 85\%$ Similarity):**
-   - *Original Search:* `sweet dreams are made of these` (len 30)
-   - *Typo Query:* `swwet dreams are nade of these` (len 30)
-   - *Edit Distance:* 2 ('w' $\leftrightarrow$ 'e', 'n' $\leftrightarrow$ 'm')
-   - *Similarity:* $93.3\%$ ($\ge 85\%$)
-   - **Action:** Returns the cached result immediately in **$\approx 1.5\text{ms}$** and automatically aliases the typo key in Dragonfly.
+- Failed Spotify track/episode URL → `spotify-url-info` metadata → `ytsearch:artist - title` → backend.
+- Failed YouTube URL → official oEmbed title/video ID → `ytsearch:` → backend.
+- Failed `ytsearch:`/`ytmsearch:` → `dzsearch:` → backend (use LavaSrc or another compatible source plugin).
+- Failed `dzsearch:` → Event Hub worker `resolveFallbackTrack`.
+- Failed provider search → `scsearch:` → backend.
+- Final search failure → `@distube/ytsr` metadata lookup → direct YouTube URL → backend.
 
-2. **Distinct Search Query ($< 85\%$ Similarity):**
-   - *Original Search:* `sweet dreams are made of these`
-   - *Targeted Query:* `sweet dreams are made of these by marilyn manson`
-   - *Similarity:* $62.5\%$ ($< 85\%$)
-   - **Action:** Differentiated as a distinct query and searched separately upstream.
+`DISTUBE_YTSR_ENABLED=false` disables the scraper-based last resort. Provider metadata resolvers have strict outer deadlines and only return backend-loadable identifiers.
 
----
+The historical `youtube-sr` package was evaluated but is not a default dependency: it is archived, lacks built-in abort handling, and its repository/npm license metadata conflicts. The maintained DisTube search adapter fills the same isolated last-resort role. The adapter registry in `src/resolvers` makes adding another resolver straightforward.
 
-## 🔗 YouTube Direct Link & Fallback Cascade
+## Typed routing rules
 
-When loading YouTube or YouTube Music URLs directly (`music.youtube.com/watch?v=...`, `youtube.com/watch?v=...`, `youtu.be/...`), YouTube frequently rate-limits direct stream requests and returns `FriendlyException: Something went wrong while looking up the track`.
-
-The proxy resolves this automatically:
-1. Extracts the **11-character video ID** (`extractYouTubeVideoId`).
-2. If the direct URL fails with any error, the fallback rule `youtubeDirectLinkFailToSearch` triggers.
-3. The proxy cascades to `ytsearch:${videoId}` to load the track via Innertube, returning a valid Lavalink track response with **0 errors**.
-
----
-
-## 🛠️ Configuration Guide (`config.ts` / `.env`)
-
-### Option 1: Edit `config.ts` (Type-Safe TypeScript)
-
-```typescript
+```ts
 import type { LavalinkProxyConfig } from "./src/types";
 
-export const config: LavalinkProxyConfig = {
-    server: {
-        port: Number(process.env.PORT || 2332),
-        host: "0.0.0.0",
-        password: process.env.PASSWORD || "youshallnotpass",
-    },
-    dragonfly: {
-        enabled: true,
-        url: process.env.DRAGONFLY_URL || "redis://127.0.0.1:6379",
-        keyPrefix: "lavalink_proxy",
-        searchTtlSeconds: 259200, // 3 days
-        trackTtlSeconds: 86400,   // 24 hours
-        lyricsTtlSeconds: 604800, // 7 days
-        maxCachedEntries: 100000, // Cap on total cached entries
-    },
-    eventHub: {
-        enabled: true,
-        path: "/proxy/events",
-        authToken: process.env.PASSWORD || "youshallnotpass",
-        defaultTimeoutMs: 3000,
-    },
-    remapping: {
-        enabled: true,
-        maxRecursionDepth: 4,
-        preRequest: [
-            {
-                name: "cleanTracking",
-                transformerName: "cleanUrlTracking",
-            },
-            {
-                name: "spotifySearchToDeezer",
-                prefix: "spsearch:",
-                rewritePrefix: "dzsearch:",
-            },
-            {
-                name: "youtubeUrlToTitleSearch",
-                match: "^https?://(www\\.|music\\.)?(youtube\\.com|youtu\\.be)/",
-                transformerName: "youtubeUrlToTitleSearch",
-            },
-        ],
-        postRequestOnFail: [
-            {
-                name: "youtubeDirectLinkFailToSearch",
-                match: "^https?://(www\\.|music\\.)?(youtube\\.com|youtu\\.be)/",
-                onErrors: ["*"],
-                targetPrefix: "ytsearch:",
-                routeToNode: "default",
-            },
-            {
-                name: "youtubeSearchFailToDeezer",
-                match: "^ytsearch:",
-                targetPrefix: "dzsearch:",
-                routeToNode: "default",
-            },
-            {
-                name: "deezerFailToEventHubWorker",
-                match: "^dzsearch:",
-                routeToFallbackFn: true,
-                eventHubHandler: "resolveFallbackTrack",
-                timeoutMs: 3500,
-            },
-            {
-                name: "lastResortSoundCloud",
-                match: "^.*$",
-                targetPrefix: "scsearch:",
-                routeToNode: "default",
-            },
-        ],
-    },
-    upstreams: {
-        default: {
-            id: "lavalink_main",
-            url: "http://127.0.0.1:2333",
-            wsUrl: "ws://127.0.0.1:2333/v4/websocket",
-            password: "youshallnotpass",
-        },
-        nodelink_node: {
-            id: "nodelink_backup",
-            url: "http://127.0.0.1:2334",
-            wsUrl: "ws://127.0.0.1:2334/v4/websocket",
-            password: "youshallnotpass",
-        },
-    },
-    logging: {
-        debug: false,
-        logHits: true,
-        logMisses: true,
-        logRoutes: true,
-        logFallbacks: true,
-    },
+const config: LavalinkProxyConfig = {
+  // server, cache, Event Hub, upstreams, logging...
+  remapping: {
+    enabled: true,
+    maxRecursionDepth: 6,
+    routeLearning: true,
+    routeLearningTtlSeconds: 1800,
+    preRequest: [
+      { name: "clean", transformerName: "cleanUrlTracking" },
+      { name: "spotify-search", prefix: "spsearch:", rewritePrefix: "dzsearch:" },
+    ],
+    postRequestOnFail: [
+      {
+        name: "youtube-auth-failure",
+        match: "^ytsearch:",
+        onLoadTypes: ["error"],
+        onErrors: ["sign in", "bot check", "403"],
+        targetPrefix: "scsearch:",
+        routeToNode: "default",
+      },
+      {
+        name: "empty-deezer-result",
+        match: "^dzsearch:",
+        onLoadTypes: ["empty"],
+        fallbackOnEmpty: true,
+        routeToFallbackFn: true,
+        eventHubHandler: "resolveFallbackTrack",
+        timeoutMs: 2500,
+        encodingScope: "lavalink-main",
+      },
+    ],
+  },
 };
-
-export default config;
 ```
 
-### Option 2: Use `.env` Variables
+Rules are evaluated in order and each fallback rule runs at most once per request. Invalid regular expressions fail closed and are logged. Disabled upstreams fall back to `default`.
 
-Copy `.env.example` to `.env`:
+Unknown standard/plugin routes are streamed unchanged to the default backend, including `/v4/info`, decode routes, LavaSearch routes, and NodeLink extensions. Player and session routes intentionally remain on the default WebSocket/playback backend.
+
+## Cache design
+
+Default values:
+
+| Data | TTL |
+|---|---:|
+| Search results | 6 hours |
+| Direct tracks/URLs | 24 hours |
+| Lyrics | 7 days |
+| Learned route | 30 minutes |
+| In-process L1 | 5 seconds / 1,000 entries |
+
+Cache schema `v3` intentionally cold-starts on upgrade so older entries without encoding provenance cannot leak across playback backends. Each remote TTL gets ±5% jitter to avoid synchronized expiry. The cache is fail-open with a 750 ms command timeout and no offline command queue. Fuzzy search aliases are disabled by default because automatic typo matching can change user intent; enable them only after measuring your queries.
+
+`maxCachedEntries` provides an application-managed LRU index. For a dedicated Dragonfly deployment, prefer Dragonfly's native memory limit/cache mode and set `MAX_CACHED_ENTRIES=0` to remove the global LRU-index hot key. Keep Dragonfly close to the proxy (same host/AZ/VPC) and measure p95/p99 latency.
+
+Cache hits expose `X-Proxy-Cache: HIT`; coalesced waiters expose `X-Proxy-Coalesced: HIT`; learned routes expose `X-Proxy-Learned-Route: HIT`.
+
+## Event Hub
+
+Workers connect to `ws://127.0.0.1:2332/proxy/events` with `Authorization` and `Client-Name` headers, then register handlers:
+
+```json
+{ "type": "handshake", "handlers": ["resolveFallbackTrack"] }
+```
+
+RPC responses are accepted only from the selected worker. On disconnect, that worker's pending calls are cancelled so the cascade can continue. See `examples/client-eventhub-example.ts`; its resolver calls a real fallback backend and returns that backend's Lavalink JSON.
+
+Do not return `CUSTOM_TRACK_ENCODED` or metadata-only synthetic tracks. The v2 builders require the encoded value explicitly and reject the old placeholder.
+
+## Operations and security
+
+| Route | Authentication | Purpose |
+|---|---|---|
+| `GET /proxy/health` | Public/minimal | Process/cache readiness |
+| `GET /proxy/stats` | Lavalink password | Cache, breaker, RPC, and coalescing stats |
+| `POST /proxy/cache/clear` | Lavalink password | SCAN/UNLINK this proxy namespace |
+| `/v4/*` | Lavalink password | Proxied Lavalink/NodeLink API |
+| `/v4/websocket` | Lavalink password | Default backend session tunnel |
+
+Passwords are never accepted through query strings. Keep Dragonfly private, use a restricted ACL/TLS where appropriate, and never place credentials in upstream URLs committed to Git.
+
+## Docker
 
 ```bash
-PORT=2332
-PASSWORD=youshallnotpass
-DRAGONFLY_URL=redis://127.0.0.1:6379
-SEARCH_TTL=259200
-TRACK_TTL=86400
-LYRICS_TTL=604800
-MAX_CACHED_ENTRIES=100000
-UPSTREAM_DEFAULT_URL=http://127.0.0.1:2333
-UPSTREAM_NODELINK_URL=http://127.0.0.1:2334
+docker build -t lavalink-dragonfly-proxy .
+docker run --rm -p 2332:2332 \
+  -e PASSWORD='replace-with-a-long-random-secret' \
+  -e UPSTREAM_DEFAULT_URL='http://host.docker.internal:2333' \
+  -e UPSTREAM_DEFAULT_WS_URL='ws://host.docker.internal:2333/v4/websocket' \
+  -e UPSTREAM_DEFAULT_PASSWORD='your-lavalink-password' \
+  -e DRAGONFLY_URL='redis://host.docker.internal:6379' \
+  lavalink-dragonfly-proxy
 ```
 
----
+The image includes the tracked environment-driven config only. Mount an ignored `config.ts` at `/app/config.ts` if you need custom rules.
 
-## 🛠️ Lavalink v4 Response Builders API
-
-Import from `src/builders` to cheaply construct valid Lavalink v4 objects:
-
-```typescript
-import {
-    buildTrack,
-    buildTrackInfo,
-    buildSearchResult,
-    buildPlaylistResult,
-    buildEmptyResult,
-    buildErrorResult,
-    createFallbackTrack,
-} from "./src/builders";
-
-// 1. Quick Track
-const track = createFallbackTrack(
-    "Rolling in the Deep",
-    "Adele",
-    "https://www.deezer.com/track/123456",
-    228000,
-    "deezer"
-);
-
-// 2. Search Result
-const searchResult = buildSearchResult([track]);
-
-// 3. Playlist Result
-const playlistResult = buildPlaylistResult("My Favorites", [track]);
-
-// 4. Safe Empty or Error Result
-const empty = buildEmptyResult();
-const error = buildErrorResult("Video unavailable in your region", "common");
-```
-
----
-
-## 📡 Event Hub RPC Client Tutorial
-
-Connect any client to `ws://localhost:2332/proxy/events` to handle fallback track lookups:
-
-```typescript
-import { buildSearchResult, buildTrack, buildTrackInfo } from "./src/builders";
-
-const ws = new WebSocket("ws://127.0.0.1:2332/proxy/events", {
-    headers: { Authorization: "youshallnotpass", "Client-Name": "BotWorker" },
-});
-
-ws.onopen = () => {
-    ws.send(
-        JSON.stringify({
-            type: "handshake",
-            handlers: ["resolveFallbackTrack"],
-        })
-    );
-};
-
-ws.onmessage = async (event) => {
-    const msg = JSON.parse(event.data.toString());
-
-    if (msg.type === "rpc_request" && msg.handler === "resolveFallbackTrack") {
-        const track = buildTrack(
-            buildTrackInfo({
-                title: "Resolved Track",
-                author: "Custom Artist",
-                uri: "https://deezer.com/track/...",
-                sourceName: "deezer",
-            })
-        );
-
-        ws.send(
-            JSON.stringify({
-                type: "rpc_response",
-                id: msg.id,
-                success: true,
-                data: buildSearchResult([track]),
-            })
-        );
-    }
-};
-```
-
-_(A complete client is provided in [`examples/client-eventhub-example.ts`](examples/client-eventhub-example.ts))_.
-
----
-
-## 🚀 Running the Proxy
+## Development
 
 ```bash
-cd /home/mivator/lavalink-dragonfly-proxy-source-routing
-
-# Run unit tests:
-bun test
-
-# Typecheck:
 bun run typecheck
-
-# Start the proxy:
-bun run start
-
-# Run Event Hub worker example:
-bun run example:client
+bun test
+bun run check
 ```
 
-### Start via pm2
+The test suite covers builders, case-safe cache canonicalization, Spotify URI mapping, routing composition, structured failures, encoding-scope isolation, malformed payload rejection, WebSocket close-code safety, authenticated admin routes, real cache clearing, and concurrent request coalescing.
 
-```bash
-pm2 start --name "[:2332] Lavalink-Dragonfly-Proxy" bun -- run start
-```
+## Inspiration and source adapters
+
+The provider-adapter boundary draws on the strongest ideas in the older Deezcord and better-erela Apple/Deezer projects: dispatch by provider resource type, retain stable provider IDs, separate display metadata from normalized matching text, bound pagination, and postpone expensive unresolved-track conversion until needed. This implementation avoids their old Erela monkey patches, unbounded API calls/token refresh, and playlist-wide conversion bursts.
+
+For full Spotify/Deezer/Apple playlist and album support, use LavaSrc/a backend source manager or an Event Hub worker that asks a compatible backend to resolve each selected item. Metadata previews and signed media URLs are not durable playback tracks.
+
+## License
+
+MIT

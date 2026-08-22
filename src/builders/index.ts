@@ -8,9 +8,6 @@ import type {
     LavalinkErrorResult,
 } from "../types";
 
-/**
- * Construct a type-safe Lavalink v4 TrackInfo object
- */
 export function buildTrackInfo(
     options: Partial<LavalinkTrackInfo> & { title: string; author: string }
 ): LavalinkTrackInfo {
@@ -29,114 +26,71 @@ export function buildTrackInfo(
     };
 }
 
-/**
- * Construct a type-safe Lavalink v4 Track
- */
+/** Build a track only from an encoded value produced by a compatible backend. */
 export function buildTrack(
     info: LavalinkTrackInfo,
-    encoded: string = "CUSTOM_TRACK_ENCODED",
-    pluginInfo: Record<string, any> = {},
-    userData: Record<string, any> = {}
+    encoded: string,
+    pluginInfo: Record<string, unknown> = {},
+    userData: Record<string, unknown> = {}
 ): LavalinkTrack {
-    return {
-        encoded,
-        info,
-        pluginInfo,
-        userData,
-    };
+    if (!encoded || encoded === "CUSTOM_TRACK_ENCODED") {
+        throw new TypeError("encoded must be a real track returned by Lavalink/NodeLink");
+    }
+    return { encoded, info, pluginInfo, userData };
 }
 
-/**
- * Create a quick track from basic metadata
- */
+/** Convenience builder for workers that already received a real encoded value. */
 export function createFallbackTrack(
+    encoded: string,
     title: string,
     author: string,
-    uri: string = "https://mivator.com",
-    lengthMs: number = 200000,
-    sourceName: string = "custom",
+    uri = "https://mivator.com",
+    lengthMs = 200000,
+    sourceName = "custom",
     artworkUrl?: string
 ): LavalinkTrack {
-    const info = buildTrackInfo({
+    return buildTrack(buildTrackInfo({
         title,
         author,
         uri,
         length: lengthMs,
         sourceName,
         artworkUrl: artworkUrl ?? null,
-    });
-    return buildTrack(info);
+    }), encoded);
 }
 
-/**
- * Construct a Lavalink v4 Search Result
- */
-export function buildSearchResult(
-    tracks: LavalinkTrack[],
-    pluginInfo?: Record<string, any>
-): LavalinkSearchResult {
-    return {
-        loadType: "search",
-        data: tracks,
-    };
+export function buildSearchResult(tracks: LavalinkTrack[]): LavalinkSearchResult {
+    return { loadType: "search", data: tracks };
 }
 
-/**
- * Construct a Lavalink v4 Single Track Result
- */
 export function buildSingleTrackResult(track: LavalinkTrack): LavalinkTrackResult {
-    return {
-        loadType: "track",
-        data: track,
-    };
+    return { loadType: "track", data: track };
 }
 
-/**
- * Construct a Lavalink v4 Playlist Result
- */
 export function buildPlaylistResult(
     name: string,
     tracks: LavalinkTrack[],
-    selectedTrack: number = 0,
-    pluginInfo?: Record<string, any>
+    selectedTrack = 0,
+    pluginInfo?: Record<string, unknown>
 ): LavalinkPlaylistResult {
     return {
         loadType: "playlist",
         data: {
-            info: {
-                name,
-                selectedTrack,
-            },
+            info: { name, selectedTrack },
             pluginInfo,
             tracks,
         },
     };
 }
 
-/**
- * Construct a Lavalink v4 Empty Result
- */
 export function buildEmptyResult(): LavalinkEmptyResult {
-    return {
-        loadType: "empty",
-        data: {},
-    };
+    return { loadType: "empty", data: {} };
 }
 
-/**
- * Construct a Lavalink v4 Error Result
- */
 export function buildErrorResult(
     message: string,
     severity: "common" | "suspicious" | "fault" = "fault",
     cause?: string
 ): LavalinkErrorResult {
-    return {
-        loadType: "error",
-        data: {
-            message,
-            severity,
-            cause,
-        },
-    };
+    return { loadType: "error", data: { message, severity, cause } };
 }

@@ -1,12 +1,23 @@
 import type { LavalinkProxyConfig, UpstreamNodeConfig, PreRequestRule, PostRequestOnFailRule } from "../types";
-import { TransformerRegistry, extractYouTubeVideoId } from "../transformers";
+import { TransformerRegistry, extractYouTubeVideoId, fetchYouTubeOEmbedTitle } from "../transformers";
+import { MetadataResolverRegistry } from "../resolvers";
+
+export type CacheCategory = "search" | "track" | "lyrics" | "other";
 
 export interface PreRequestResult {
     transformedIdentifier: string;
     targetNode: UpstreamNodeConfig;
     isRemapped: boolean;
     appliedRule?: PreRequestRule;
-    cacheCategory: "search" | "track" | "lyrics" | "other";
+    cacheCategory: CacheCategory;
+}
+
+export interface FallbackFailureContext {
+    originalIdentifier: string;
+    message: string;
+    isEmpty: boolean;
+    httpStatus?: number;
+    loadType?: "empty" | "error";
 }
 
 export interface FallbackResolution {
@@ -16,95 +27,125 @@ export interface FallbackResolution {
     isEventHub: boolean;
     isInProcess: boolean;
     handlerName?: string;
+    timeoutMs?: number;
+    encodingScope: string;
+}
+
+export function classifyIdentifier(identifier: string): CacheCategory {
+    const value = identifier.trim();
+    if (!value) return "other";
+    if (/^(?:lyrics|lyricsearch):/i.test(value)) return "lyrics";
+
+    const prefix = value.match(/^([a-z0-9_-]+(?:\[[^\]]+\])?):/i)?.[1]?.toLowerCase();
+    if (prefix && (prefix.includes("search") || prefix === "search" || prefix === "isrc" || prefix === "rec")) {
+        return "search";
+    }
+    return "track";
+}
+
+function matchesRule(rule: { prefix?: string; match?: string }, identifier: string): boolean {
+    if (!rule.prefix && !rule.match) return true;
+    if (rule.prefix && identifier.startsWith(rule.prefix)) return true;
+    if (!rule.match) return false;
+    try {
+        return new RegExp(rule.match, "i").test(identifier);
+    } catch {
+        console.warn(`[Router] Ignoring invalid regular expression: ${rule.match}`);
+        return false;
+    }
 }
 
 export class UpstreamRouter {
     private config: LavalinkProxyConfig;
-    public transformers: TransformerRegistry;
+    public readonly transformers: TransformerRegistry;
+    public readonly resolvers: MetadataResolverRegistry;
 
     constructor(config: LavalinkProxyConfig) {
         this.config = config;
         this.transformers = new TransformerRegistry();
+        this.resolvers = new MetadataResolverRegistry();
     }
 
     public updateConfig(newConfig: LavalinkProxyConfig): void {
         this.config = newConfig;
     }
 
-    /**
-     * Stage 1: Pre-Request Transformations & Initial Upstream Selection
-     */
+    private getNode(nodeName: string): UpstreamNodeConfig {
+        const selected = this.config.upstreams[nodeName];
+        if (selected?.enabled !== false) return selected;
+        return this.config.upstreams.default;
+    }
+
+    /** Apply every matching rule in order so cleaning, rewriting, and node routing compose. */
     public async applyPreRequest(rawIdentifier: string): Promise<PreRequestResult> {
         let identifier = rawIdentifier.trim();
         let targetNodeName = "default";
         let isRemapped = false;
         let appliedRule: PreRequestRule | undefined;
-        let cacheCategory: "search" | "track" | "lyrics" | "other" = "track";
 
         if (!identifier) {
             return {
                 transformedIdentifier: rawIdentifier,
-                targetNode: this.config.upstreams.default,
+                targetNode: this.getNode("default"),
                 isRemapped: false,
                 cacheCategory: "other",
             };
         }
 
-        if (identifier.includes("search:") || identifier.includes("isrc:") || identifier.includes("rec:")) {
-            cacheCategory = "search";
-        }
-
         if (this.config.remapping.enabled && Array.isArray(this.config.remapping.preRequest)) {
             for (const rule of this.config.remapping.preRequest) {
-                let matched = false;
+                if (!matchesRule(rule, identifier)) continue;
+                appliedRule = rule;
 
-                // Match exact prefix
-                if (rule.prefix && identifier.startsWith(rule.prefix)) {
-                    matched = true;
-                    if (rule.rewritePrefix) {
-                        identifier = rule.rewritePrefix + identifier.slice(rule.prefix.length);
-                        isRemapped = true;
-                        cacheCategory = "search";
-                    }
+                if (rule.prefix && rule.rewritePrefix && identifier.startsWith(rule.prefix)) {
+                    const rewritten = rule.rewritePrefix + identifier.slice(rule.prefix.length);
+                    isRemapped ||= rewritten !== identifier;
+                    identifier = rewritten;
                 }
 
-                // Match regex pattern
-                if (rule.match && new RegExp(rule.match, "i").test(identifier)) {
-                    matched = true;
+                if (rule.routeToNode && this.config.upstreams[rule.routeToNode]?.enabled !== false) {
+                    targetNodeName = rule.routeToNode;
                 }
 
-                if (matched) {
-                    appliedRule = rule;
-                    if (rule.routeToNode && this.config.upstreams[rule.routeToNode]) {
-                        targetNodeName = rule.routeToNode;
-                    }
-                    if (rule.transformerName) {
-                        identifier = await this.transformers.transformQuery(rule.transformerName, identifier);
-                        isRemapped = true;
-                    }
-                    break;
+                if (rule.transformerName) {
+                    const transformed = await this.transformers.transformQuery(rule.transformerName, identifier);
+                    isRemapped ||= transformed !== identifier;
+                    identifier = transformed;
                 }
             }
         }
 
-        const targetNode = this.config.upstreams[targetNodeName] || this.config.upstreams.default;
-
         return {
             transformedIdentifier: identifier,
-            targetNode,
+            targetNode: this.getNode(targetNodeName),
             isRemapped,
             appliedRule,
-            cacheCategory,
+            cacheCategory: classifyIdentifier(identifier),
         };
     }
 
-    /**
-     * Stage 2: Post-Request On-Fail Fallback Matching
-     */
+    private failureMatches(rule: PostRequestOnFailRule, failure: FallbackFailureContext): boolean {
+        if (failure.isEmpty && rule.fallbackOnEmpty === false) return false;
+
+        const effectiveLoadType = failure.isEmpty ? "empty" : failure.loadType;
+        if (rule.onLoadTypes && (!effectiveLoadType || !rule.onLoadTypes.includes(effectiveLoadType))) {
+            return false;
+        }
+        if (rule.onHttpStatuses && (!failure.httpStatus || !rule.onHttpStatuses.includes(failure.httpStatus))) {
+            return false;
+        }
+        if (rule.onErrors?.length) {
+            if (rule.onErrors.includes("*")) return true;
+            const message = failure.message.toLowerCase();
+            return rule.onErrors.some((part) => message.includes(part.toLowerCase()));
+        }
+        return true;
+    }
+
+    /** Select and prepare the next backend attempt for a structured failure. */
     public async getNextFallback(
         currentIdentifier: string,
-        lastErrorMsg: string = "",
-        isEmpty: boolean = false,
+        failure: FallbackFailureContext,
         usedRuleNames: Set<string> = new Set()
     ): Promise<FallbackResolution | null> {
         if (!this.config.remapping.enabled || !Array.isArray(this.config.remapping.postRequestOnFail)) {
@@ -114,64 +155,57 @@ export class UpstreamRouter {
         for (const rule of this.config.remapping.postRequestOnFail) {
             if (usedRuleNames.has(rule.name)) continue;
 
-            const regex = new RegExp(rule.match, "i");
-            if (!regex.test(currentIdentifier)) continue;
+            const matchesCurrent = matchesRule(rule, currentIdentifier);
+            const matchesOriginal = matchesRule(rule, failure.originalIdentifier);
+            if (!matchesCurrent && !matchesOriginal) continue;
+            if (!this.failureMatches(rule, failure)) continue;
 
-            // Check if error condition matches
-            let errorMatches = false;
-            if (isEmpty && (rule.fallbackOnEmpty ?? true)) {
-                errorMatches = true;
-            } else if (Array.isArray(rule.onErrors) && rule.onErrors.length > 0) {
-                if (rule.onErrors.includes("*")) {
-                    errorMatches = true;
-                } else {
-                    errorMatches = rule.onErrors.some((errSub) =>
-                        lastErrorMsg.toLowerCase().includes(errSub.toLowerCase())
-                    );
-                }
-            } else {
-                errorMatches = true;
-            }
-
-            if (!errorMatches) continue;
-
-            // Calculate next identifier
             let nextIdentifier = currentIdentifier;
+            const matchedIdentifier = matchesCurrent ? currentIdentifier : failure.originalIdentifier;
 
-            // If it's a YouTube URL or 11-char ID and fallback has a target prefix, resolve to clean song title
-            const ytVideoId =
-                extractYouTubeVideoId(currentIdentifier) ||
-                (/^[\w-]{11}$/.test(currentIdentifier) ? currentIdentifier : null);
+            if (rule.metadataResolver) {
+                const resolved = await this.resolvers.resolve(rule.metadataResolver, currentIdentifier, {
+                    originalIdentifier: failure.originalIdentifier,
+                    timeoutMs: rule.timeoutMs ?? 1800,
+                });
+                if (!resolved) continue;
+                nextIdentifier = resolved;
+            } else {
+                const ytVideoId =
+                    extractYouTubeVideoId(matchedIdentifier) ||
+                    (/^[\w-]{11}$/.test(matchedIdentifier) ? matchedIdentifier : null);
 
-            if (ytVideoId && rule.targetPrefix) {
-                const { fetchYouTubeOEmbedTitle } = await import("../transformers");
-                const oembed = await fetchYouTubeOEmbedTitle(ytVideoId);
-                if (oembed && oembed.title) {
-                    nextIdentifier = rule.targetPrefix + oembed.title;
-                } else {
-                    nextIdentifier = rule.targetPrefix + ytVideoId;
-                }
-            } else if (rule.rewritePrefix && rule.targetPrefix && nextIdentifier.startsWith(rule.rewritePrefix)) {
-                nextIdentifier = rule.targetPrefix + nextIdentifier.slice(rule.rewritePrefix.length);
-            } else if (rule.targetPrefix && !nextIdentifier.startsWith(rule.targetPrefix)) {
-                if (nextIdentifier.includes("search:")) {
-                    const queryPart = nextIdentifier.slice(nextIdentifier.indexOf(":") + 1);
+                if (ytVideoId && rule.targetPrefix) {
+                    const oembed = await fetchYouTubeOEmbedTitle(ytVideoId);
+                    nextIdentifier = rule.targetPrefix + (oembed?.title || ytVideoId);
+                } else if (rule.rewritePrefix && rule.targetPrefix && nextIdentifier.startsWith(rule.rewritePrefix)) {
+                    nextIdentifier = rule.targetPrefix + nextIdentifier.slice(rule.rewritePrefix.length);
+                } else if (rule.targetPrefix && !nextIdentifier.startsWith(rule.targetPrefix)) {
+                    const colonIndex = nextIdentifier.indexOf(":");
+                    const queryPart = classifyIdentifier(nextIdentifier) === "search" && colonIndex >= 0
+                        ? nextIdentifier.slice(colonIndex + 1)
+                        : nextIdentifier;
                     nextIdentifier = rule.targetPrefix + queryPart;
-                } else {
-                    nextIdentifier = rule.targetPrefix + nextIdentifier;
                 }
             }
 
-            const targetNodeName = rule.routeToNode || "default";
-            const targetNode = this.config.upstreams[targetNodeName] || this.config.upstreams.default;
-
+            const targetNode = this.getNode(rule.routeToNode || "default");
+            const isEventHub = Boolean(rule.routeToFallbackFn && rule.eventHubHandler);
+            const isInProcess = Boolean(rule.inProcessTransformer);
+            const explicitEncodingScope = rule.encodingScope?.trim();
+            if ((isEventHub || isInProcess) && !explicitEncodingScope) {
+                console.warn(`[Router] Ignoring non-node fallback "${rule.name}" without encodingScope`);
+                continue;
+            }
             return {
                 rule,
                 nextIdentifier,
                 targetNode,
-                isEventHub: !!rule.routeToFallbackFn && !!rule.eventHubHandler,
-                isInProcess: !!rule.inProcessTransformer,
+                isEventHub,
+                isInProcess,
                 handlerName: rule.eventHubHandler || rule.inProcessTransformer,
+                timeoutMs: rule.timeoutMs,
+                encodingScope: explicitEncodingScope || targetNode.encodingScope?.trim() || targetNode.id,
             };
         }
 

@@ -1,5 +1,5 @@
 import type { LavalinkLoadResult } from "../types";
-import { buildSearchResult, buildTrack, buildTrackInfo, buildEmptyResult } from "../builders";
+import { buildEmptyResult } from "../builders";
 
 /**
  * Extract YouTube Video ID from any YouTube / YouTube Music URL
@@ -145,18 +145,6 @@ export class TransformerRegistry {
             return data;
         });
 
-        // Mock fallback resolver using builders
-        this.registerFallbackFunction("mockResolver", async (identifier: string) => {
-            const track = buildTrack(
-                buildTrackInfo({
-                    title: `Resolved: ${identifier}`,
-                    author: "InProcessResolver",
-                    uri: "https://mivator.com",
-                    sourceName: "custom",
-                })
-            );
-            return buildSearchResult([track]);
-        });
     }
 
     public registerQueryTransformer(name: string, fn: QueryTransformerFn): void {

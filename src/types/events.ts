@@ -3,7 +3,7 @@ import type { LavalinkLoadResult } from "./lavalink";
 
 export interface RpcHandshakeMessage {
     type: "handshake";
-    clientId: string;
+    clientId?: string;
     clientName?: string;
     handlers: string[];
 }
@@ -17,7 +17,7 @@ export interface RpcRequestMessage {
         originalIdentifier: string;
         attempt: number;
         lastError?: string;
-        context?: Record<string, any>;
+        context?: Record<string, unknown>;
     };
     timeoutMs: number;
 }
@@ -37,6 +37,8 @@ export interface WsClientData {
     handlers?: Set<string>;
     upstreamWs?: WebSocket;
     messageQueue?: (string | ArrayBuffer | Uint8Array)[];
+    messageQueueBytes?: number;
+    upstreamConnectTimer?: ReturnType<typeof setTimeout>;
     isUpstreamOpen?: boolean;
 }
 

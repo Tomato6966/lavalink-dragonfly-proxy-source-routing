@@ -6,20 +6,22 @@ import type {
     ProxyWebSocket,
     LavalinkLoadResult,
 } from "../types";
+import { isLavalinkLoadResult } from "../validation/lavalink";
 
 interface PendingRpc {
     id: string;
     handler: string;
+    targetClientId: string;
     resolve: (data: LavalinkLoadResult) => void;
-    reject: (err: Error) => void;
+    reject: (error: Error) => void;
     timer: ReturnType<typeof setTimeout>;
 }
 
 export class EventHubManager {
     private config: EventHubConfig;
-    private clients: Map<string, ProxyWebSocket> = new Map();
-    private pendingRpcs: Map<string, PendingRpc> = new Map();
-    private rpcCounter: number = 0;
+    private readonly clients = new Map<string, ProxyWebSocket>();
+    private readonly pendingRpcs = new Map<string, PendingRpc>();
+    private rpcCounter = 0;
 
     constructor(config: EventHubConfig) {
         this.config = config;
@@ -33,72 +35,78 @@ export class EventHubManager {
         return this.clients.size;
     }
 
+    public get pendingRpcCount(): number {
+        return this.pendingRpcs.size;
+    }
+
     public onOpen(ws: ProxyWebSocket): void {
         const { clientId, name } = ws.data;
         this.clients.set(clientId, ws);
-        console.log(`[EventHub] Client connected: ${name || "Worker"} (${clientId}) [Active: ${this.clients.size}]`);
-
-        ws.send(
-            JSON.stringify({
-                type: "connected",
-                clientId,
-                serverTime: Date.now(),
-                message: "Connected to Lavalink Native Bun Event Hub",
-            })
-        );
+        console.log(`[EventHub] Client connected: ${name || "Worker"} (${clientId})`);
+        ws.send(JSON.stringify({
+            type: "connected",
+            clientId,
+            serverTime: Date.now(),
+            message: "Connected to Lavalink proxy Event Hub",
+        }));
     }
 
     public onMessage(ws: ProxyWebSocket, message: string | Buffer): void {
         try {
             const rawText = typeof message === "string" ? message : Buffer.from(message).toString("utf-8");
-            const msg = JSON.parse(rawText);
+            const msg = JSON.parse(rawText) as Record<string, unknown>;
 
-            // 1. Handshake
             if (msg.type === "handshake") {
-                const handshake = msg as RpcHandshakeMessage;
-                if (Array.isArray(handshake.handlers)) {
-                    ws.data.handlers = new Set(handshake.handlers);
-                    if (handshake.clientName) ws.data.name = handshake.clientName;
-                    console.log(`[EventHub] Client ${ws.data.name} registered handlers: [${Array.from(ws.data.handlers).join(", ")}]`);
+                const handshake = msg as unknown as RpcHandshakeMessage;
+                const handlers = Array.isArray(handshake.handlers)
+                    ? handshake.handlers.filter((handler) => typeof handler === "string" && handler.length <= 100).slice(0, 100)
+                    : [];
+                ws.data.handlers = new Set(handlers);
+                if (typeof handshake.clientName === "string" && handshake.clientName.length <= 100) {
+                    ws.data.name = handshake.clientName;
                 }
                 return;
             }
 
-            // 2. RPC Response
             if (msg.type === "rpc_response") {
-                const rpcResponse = msg as RpcResponseMessage;
-                const pending = this.pendingRpcs.get(rpcResponse.id);
-                if (pending) {
-                    clearTimeout(pending.timer);
-                    this.pendingRpcs.delete(rpcResponse.id);
+                const response = msg as unknown as RpcResponseMessage;
+                const pending = this.pendingRpcs.get(response.id);
+                if (!pending) return;
+                if (pending.targetClientId !== ws.data.clientId) {
+                    console.warn(`[EventHub] Ignored RPC response ${response.id} from the wrong client`);
+                    return;
+                }
 
-                    if (rpcResponse.success && rpcResponse.data) {
-                        pending.resolve(rpcResponse.data);
-                    } else {
-                        pending.reject(new Error(rpcResponse.error || "Client RPC returned failure"));
-                    }
+                clearTimeout(pending.timer);
+                this.pendingRpcs.delete(response.id);
+                if (response.success && isLavalinkLoadResult(response.data)) {
+                    pending.resolve(response.data);
+                } else {
+                    const message = typeof response.error === "string" ? response.error : "Client RPC returned an invalid load result";
+                    pending.reject(new Error(message));
                 }
                 return;
             }
 
-            // 3. Heartbeat
             if (msg.type === "ping") {
                 ws.send(JSON.stringify({ type: "pong", timestamp: Date.now() }));
-                return;
             }
-        } catch (err: any) {
-            console.error(`[EventHub] Invalid JSON from client ${ws.data.clientId}:`, err?.message);
+        } catch (error) {
+            console.error(`[EventHub] Invalid message from ${ws.data.clientId}:`, error instanceof Error ? error.message : error);
         }
     }
 
-    public onClose(ws: ProxyWebSocket, code: number, reason: string): void {
+    public onClose(ws: ProxyWebSocket, code: number, _reason: string): void {
         this.clients.delete(ws.data.clientId);
-        console.log(`[EventHub] Client disconnected: ${ws.data.name || ws.data.clientId} (${code}) [Remaining: ${this.clients.size}]`);
+        for (const [id, pending] of this.pendingRpcs) {
+            if (pending.targetClientId !== ws.data.clientId) continue;
+            clearTimeout(pending.timer);
+            this.pendingRpcs.delete(id);
+            pending.reject(new Error("Event Hub client disconnected"));
+        }
+        console.log(`[EventHub] Client disconnected: ${ws.data.name || ws.data.clientId} (${code})`);
     }
 
-    /**
-     * Dispatch an RPC call to a connected client
-     */
     public async callHandler(
         handlerName: string,
         payload: {
@@ -106,46 +114,44 @@ export class EventHubManager {
             originalIdentifier: string;
             attempt: number;
             lastError?: string;
-            context?: Record<string, any>;
+            context?: Record<string, unknown>;
         },
         timeoutMs?: number
     ): Promise<LavalinkLoadResult | null> {
-        if (!this.config.enabled || this.clients.size === 0) {
-            return null;
-        }
+        if (!this.config.enabled || this.clients.size === 0) return null;
 
-        const eligibleClients = Array.from(this.clients.values()).filter(
+        const eligible = Array.from(this.clients.values()).filter(
             (ws) => ws.readyState === 1 && (ws.data.handlers?.has(handlerName) || ws.data.handlers?.has("*"))
         );
+        if (!eligible.length) return null;
 
-        if (eligibleClients.length === 0) {
-            console.warn(`[EventHub] No connected clients registered for handler "${handlerName}"`);
-            return null;
+        const loadByClient = new Map<string, number>();
+        for (const pending of this.pendingRpcs.values()) {
+            loadByClient.set(pending.targetClientId, (loadByClient.get(pending.targetClientId) ?? 0) + 1);
         }
-
-        const targetClient = eligibleClients[Math.floor(Math.random() * eligibleClients.length)];
+        eligible.sort((left, right) =>
+            (loadByClient.get(left.data.clientId) ?? 0) - (loadByClient.get(right.data.clientId) ?? 0)
+        );
+        const targetClient = eligible[0];
         const rpcId = `rpc_${Date.now()}_${++this.rpcCounter}`;
-        const timeout = timeoutMs || this.config.defaultTimeoutMs || 3000;
+        const timeout = timeoutMs ?? this.config.defaultTimeoutMs ?? 3000;
 
         return new Promise<LavalinkLoadResult | null>((resolve) => {
             const timer = setTimeout(() => {
                 this.pendingRpcs.delete(rpcId);
-                console.warn(`[EventHub] RPC "${handlerName}" timed out after ${timeout}ms (Query: "${payload.identifier}")`);
                 resolve(null);
             }, timeout);
 
             this.pendingRpcs.set(rpcId, {
                 id: rpcId,
                 handler: handlerName,
-                resolve: (data) => resolve(data),
-                reject: (err) => {
-                    console.warn(`[EventHub] RPC "${handlerName}" failed: ${err.message}`);
-                    resolve(null);
-                },
+                targetClientId: targetClient.data.clientId,
+                resolve,
+                reject: () => resolve(null),
                 timer,
             });
 
-            const rpcRequest: RpcRequestMessage = {
+            const request: RpcRequestMessage = {
                 type: "rpc_request",
                 id: rpcId,
                 handler: handlerName,
@@ -154,13 +160,22 @@ export class EventHubManager {
             };
 
             try {
-                targetClient.send(JSON.stringify(rpcRequest));
-            } catch (err: any) {
+                targetClient.send(JSON.stringify(request));
+            } catch {
                 clearTimeout(timer);
                 this.pendingRpcs.delete(rpcId);
-                console.error(`[EventHub] Failed to send RPC to client ${targetClient.data.name}:`, err.message);
                 resolve(null);
             }
         });
+    }
+
+    public close(): void {
+        for (const pending of this.pendingRpcs.values()) {
+            clearTimeout(pending.timer);
+            pending.reject(new Error("Event Hub shutting down"));
+        }
+        this.pendingRpcs.clear();
+        for (const client of this.clients.values()) client.close(1001, "Server shutting down");
+        this.clients.clear();
     }
 }

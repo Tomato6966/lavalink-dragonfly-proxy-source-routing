@@ -8,7 +8,7 @@
  *   bun run examples/client-eventhub-example.ts
  */
 
-import { buildSearchResult, buildTrack, buildTrackInfo, buildEmptyResult } from "../src/builders";
+import { buildEmptyResult } from "../src/builders";
 import type { LavalinkLoadResult } from "../src/types";
 
 interface RpcRequestMessage {
@@ -141,21 +141,18 @@ const client = new LavalinkProxyEventHubClient({
     clientName: "CustomMusicWorker-1",
 });
 
-// Handler 1: Custom Fallback Resolver
+// Handler 1: Resolve through a real compatible backend so the encoded track is playable.
 client.registerHandler("resolveFallbackTrack", async (data) => {
-    console.log(`[CustomResolver] Resolving fallback for: ${data.identifier}`);
-
-    // Build Lavalink v4 Track cheaply and safely
-    const trackInfo = buildTrackInfo({
-        title: "Rolling in the Deep (Fallback Resolved)",
-        author: "Adele",
-        length: 228000,
-        uri: "https://www.deezer.com/track/123456",
-        sourceName: "deezer",
+    const upstream = process.env.FALLBACK_UPSTREAM_URL || "http://127.0.0.1:2333";
+    const password = process.env.FALLBACK_UPSTREAM_PASSWORD || "youshallnotpass";
+    const url = new URL("/v4/loadtracks", upstream);
+    url.searchParams.set("identifier", data.identifier);
+    const response = await fetch(url, {
+        headers: { Authorization: password, Accept: "application/json" },
+        signal: AbortSignal.timeout(2500),
     });
-
-    const track = buildTrack(trackInfo);
-    return buildSearchResult([track]);
+    if (!response.ok) throw new Error(`Fallback backend returned HTTP `);
+    return await response.json() as LavalinkLoadResult;
 });
 
 // Handler 2: Spotify Scraper Fallback

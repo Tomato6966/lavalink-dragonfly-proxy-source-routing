@@ -12,130 +12,116 @@ export * from "./cache";
 export * from "./routing";
 export * from "./eventHub";
 export * from "./transformers";
+export * from "./resolvers";
 
-async function main() {
-    console.log("=================================================");
-    console.log("⚡ Lavalink Dragonfly Proxy & Native Bun Engine");
-    console.log("=================================================");
-
+async function main(): Promise<void> {
     const config = await loadConfig();
-    console.log(`[Config] Loaded configuration for server port ${config.server.port}`);
-
     const cacheManager = new DragonflyCacheManager(config.dragonfly);
     const router = new UpstreamRouter(config);
     const eventHub = new EventHubManager(config.eventHub);
     const httpHandler = new HttpProxyHandler(config, cacheManager, router, eventHub);
     const wsProxy = new WebSocketProxyHandler(config);
-
-    const pendingUpgradeHeaders: Map<string, Record<string, string>> = new Map();
+    const pendingUpgradeHeaders = new Map<string, Record<string, string>>();
 
     const server = Bun.serve<WsClientData>({
         port: config.server.port,
         hostname: config.server.host,
-        async fetch(req, server) {
-            const urlObj = new URL(req.url);
+        idleTimeout: 30,
+        maxRequestBodySize: 16 * 1024 * 1024,
+        async fetch(req, bunServer) {
+            const url = new URL(req.url);
 
-            // 1. Upgrade WebSocket for Event Hub RPC
-            if (config.eventHub.enabled && urlObj.pathname === (config.eventHub.path || "/proxy/events")) {
-                const token = urlObj.searchParams.get("token") || req.headers.get("authorization");
-                if (config.eventHub.authToken && token !== config.eventHub.authToken) {
+            if (config.eventHub.enabled && url.pathname === (config.eventHub.path || "/proxy/events")) {
+                if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+                    return new Response("WebSocket upgrade required", { status: 426 });
+                }
+                if (req.headers.get("authorization") !== config.eventHub.authToken) {
                     return new Response("Unauthorized", { status: 401 });
                 }
 
-                const clientId = `client_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-                const upgraded = server.upgrade(req, {
+                const clientId = `client_${crypto.randomUUID()}`;
+                const upgraded = bunServer.upgrade(req, {
                     data: {
                         type: "event_hub",
                         clientId,
                         name: req.headers.get("client-name") || "Worker",
-                        handlers: new Set(["*"]),
+                        handlers: new Set<string>(),
                     },
                 });
-
-                if (upgraded) return undefined;
-                return new Response("Upgrade failed", { status: 400 });
+                return upgraded ? undefined : new Response("Upgrade failed", { status: 400 });
             }
 
-            // 2. Upgrade WebSocket for Lavalink Player/Voice Passthrough
-            if (urlObj.pathname === "/v4/websocket" || req.headers.get("upgrade")?.toLowerCase() === "websocket") {
-                const clientAuth = req.headers.get("authorization");
-                if (config.server.password && clientAuth !== config.server.password) {
+            if (url.pathname === "/v4/websocket") {
+                if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+                    return new Response("WebSocket upgrade required", { status: 426 });
+                }
+                if (config.server.password && req.headers.get("authorization") !== config.server.password) {
                     return new Response("Unauthorized", { status: 401 });
                 }
 
-                const clientId = `session_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-                const headersObj: Record<string, string> = {};
-                req.headers.forEach((val, key) => (headersObj[key.toLowerCase()] = val));
-                pendingUpgradeHeaders.set(clientId, headersObj);
-
-                const upgraded = server.upgrade(req, {
-                    data: {
-                        type: "lavalink_passthrough",
-                        clientId,
-                    },
+                const clientId = `session_${crypto.randomUUID()}`;
+                const headers: Record<string, string> = {};
+                req.headers.forEach((value, key) => (headers[key.toLowerCase()] = value));
+                pendingUpgradeHeaders.set(clientId, headers);
+                const upgraded = bunServer.upgrade(req, {
+                    data: { type: "lavalink_passthrough", clientId },
                 });
-
-                if (upgraded) return undefined;
-                return new Response("Upgrade failed", { status: 400 });
+                if (!upgraded) pendingUpgradeHeaders.delete(clientId);
+                return upgraded ? undefined : new Response("Upgrade failed", { status: 400 });
             }
 
-            // 3. Handle REST Requests
             try {
                 return await httpHandler.handleRequest(req);
-            } catch (err: any) {
-                console.error("[Server:Error] Unhandled request error:", err);
+            } catch (error) {
+                console.error("[Server] Unhandled request error:", error);
                 return Response.json({ error: "Internal Server Error" }, { status: 500 });
             }
         },
         websocket: {
+            maxPayloadLength: 1024 * 1024,
+            backpressureLimit: config.server.websocketMaxQueueBytes ?? 1024 * 1024,
+            closeOnBackpressureLimit: true,
+            sendPings: true,
             open(ws) {
                 if (ws.data.type === "event_hub") {
                     eventHub.onOpen(ws);
-                } else if (ws.data.type === "lavalink_passthrough") {
+                } else {
                     const headers = pendingUpgradeHeaders.get(ws.data.clientId) || {};
                     pendingUpgradeHeaders.delete(ws.data.clientId);
                     wsProxy.onOpen(ws, headers);
                 }
             },
             message(ws, message) {
-                if (ws.data.type === "event_hub") {
-                    eventHub.onMessage(ws, message);
-                } else if (ws.data.type === "lavalink_passthrough") {
-                    wsProxy.onMessage(ws, message);
-                }
+                if (ws.data.type === "event_hub") eventHub.onMessage(ws, message);
+                else wsProxy.onMessage(ws, message);
             },
             close(ws, code, reason) {
-                if (ws.data.type === "event_hub") {
-                    eventHub.onClose(ws, code, reason);
-                } else if (ws.data.type === "lavalink_passthrough") {
-                    wsProxy.onClose(ws, code, reason);
-                }
+                if (ws.data.type === "event_hub") eventHub.onClose(ws, code, reason);
+                else wsProxy.onClose(ws, code, reason);
             },
         },
     });
 
-    console.log(`[Proxy] Native Bun Server running on http://${server.hostname}:${server.port}`);
-    console.log(`[Proxy] Default Upstream: ${config.upstreams.default.url}`);
-    if (Object.keys(config.upstreams).length > 1) {
-        console.log(`[Proxy] Additional Upstreams: ${Object.keys(config.upstreams).filter((k) => k !== "default").join(", ")}`);
-    }
-    console.log(`[Proxy] Event Hub RPC: ${config.eventHub.enabled ? `ENABLED (${config.eventHub.path})` : "DISABLED"}`);
-    console.log(`[Proxy] Multi-Stage Remapping: ${config.remapping.enabled ? `ENABLED (Max Depth: ${config.remapping.maxRecursionDepth})` : "DISABLED"}`);
-    console.log(`[Proxy] Dragonfly Cache: ${config.dragonfly.enabled ? `ENABLED (Max: ${config.dragonfly.maxCachedEntries})` : "DISABLED"}`);
-    console.log("=================================================\n");
+    console.log(`[Proxy] Bun server listening on http://${server.hostname}:${server.port}`);
+    console.log(`[Proxy] Default playback upstream: ${config.upstreams.default.id} (${config.upstreams.default.url})`);
+    console.log(`[Proxy] Dragonfly cache: ${config.dragonfly.enabled ? "enabled" : "disabled"}`);
+    console.log(`[Proxy] Event Hub: ${config.eventHub.enabled ? config.eventHub.path : "disabled"}`);
 
-    const shutdown = () => {
-        console.log("\n[Proxy] Shutting down gracefully...");
+    let shuttingDown = false;
+    const shutdown = async (): Promise<void> => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        console.log("[Proxy] Shutting down gracefully");
+        eventHub.close();
         server.stop(true);
-        console.log("[Proxy] Native Bun Server stopped.");
-        process.exit(0);
+        await cacheManager.close();
     };
 
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
+    process.once("SIGINT", () => void shutdown());
+    process.once("SIGTERM", () => void shutdown());
 }
 
-main().catch((err) => {
-    console.error("[Fatal] Failed to start Lavalink Native Proxy:", err);
+main().catch((error) => {
+    console.error("[Fatal] Failed to start Lavalink proxy:", error);
     process.exit(1);
 });

@@ -1,18 +1,27 @@
 {
   "name": "lavalink-dragonfly-proxy-source-routing",
-  "version": "1.1.0",
-  "description": "High-performance native Bun Lavalink proxy with Dragonfly caching, source remapping, and Event Hub RPC",
+  "version": "2.0.0",
+  "description": "Resilient Bun proxy for Lavalink v4 with Dragonfly caching, source fallbacks, and request coalescing",
   "main": "src/index.ts",
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun --watch src/index.ts",
     "example:client": "bun run examples/client-eventhub-example.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun test"
   },
   "dependencies": {
-    "ioredis": "^5.4.1"
+    "@distube/ytsr": "^2.0.4",
+    "ioredis": "^5.4.1",
+    "spotify-uri": "^4.1.0",
+    "spotify-url-info": "^3.3.3"
   },
+  "engines": {
+    "bun": ">=1.3.0"
+  },
+  "license": "MIT",
   "devDependencies": {
     "@types/bun": "^1.4.0",
     "typescript": "^5.5.4"

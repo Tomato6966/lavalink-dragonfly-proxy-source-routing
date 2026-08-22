@@ -1,395 +1,457 @@
+import { createHash } from "node:crypto";
 import { Redis } from "ioredis";
 import type { DragonflyCacheConfig, LearnedRoute } from "../types";
+import { canonicalizeSpotifyIdentifier } from "../resolvers";
 
 export interface CacheStats {
     hits: number;
+    memoryHits: number;
     fuzzyHits: number;
     misses: number;
     writes: number;
     evictions: number;
     errors: number;
+    clears: number;
     estimatedEntries: number;
 }
 
-/**
- * Fast Levenshtein distance calculation
- */
 export function calculateLevenshteinDistance(a: string, b: string): number {
     if (a === b) return 0;
-    if (a.length === 0) return b.length;
-    if (b.length === 0) return a.length;
+    if (!a.length) return b.length;
+    if (!b.length) return a.length;
+    if (a.length > b.length) [a, b] = [b, a];
 
-    const matrix: number[][] = [];
+    let previous = Array.from({ length: a.length + 1 }, (_, index) => index);
+    let current = new Array<number>(a.length + 1);
 
-    for (let i = 0; i <= b.length; i++) {
-        matrix[i] = [i];
-    }
-    for (let j = 0; j <= a.length; j++) {
-        matrix[0][j] = j;
-    }
-
-    for (let i = 1; i <= b.length; i++) {
-        for (let j = 1; j <= a.length; j++) {
-            if (b.charAt(i - 1) === a.charAt(j - 1)) {
-                matrix[i][j] = matrix[i - 1][j - 1];
-            } else {
-                matrix[i][j] = Math.min(
-                    matrix[i - 1][j - 1] + 1, // substitution
-                    matrix[i][j - 1] + 1,     // insertion
-                    matrix[i - 1][j] + 1      // deletion
-                );
-            }
+    for (let row = 1; row <= b.length; row++) {
+        current[0] = row;
+        for (let column = 1; column <= a.length; column++) {
+            const substitutionCost = b.charCodeAt(row - 1) === a.charCodeAt(column - 1) ? 0 : 1;
+            current[column] = Math.min(
+                previous[column] + 1,
+                current[column - 1] + 1,
+                previous[column - 1] + substitutionCost
+            );
         }
+        [previous, current] = [current, previous];
     }
 
-    return matrix[b.length][a.length];
+    return previous[a.length];
 }
 
-/**
- * Calculate string similarity ratio between 0.0 and 1.0
- */
 export function calculateSimilarity(a: string, b: string): number {
     const maxLen = Math.max(a.length, b.length);
-    if (maxLen === 0) return 1.0;
-    const distance = calculateLevenshteinDistance(a, b);
-    return 1.0 - distance / maxLen;
+    return maxLen === 0 ? 1 : 1 - calculateLevenshteinDistance(a, b) / maxLen;
 }
 
-/**
- * Normalize search query for fuzzy typo comparison
- */
 export function normalizeSearchQuery(raw: string): { prefix: string; cleanQuery: string } {
-    let text = raw.trim().toLowerCase();
+    let text = raw.trim().normalize("NFKC");
     let prefix = "";
-
-    const colonIdx = text.indexOf(":");
-    if (colonIdx > 0 && colonIdx <= 10) {
-        prefix = text.slice(0, colonIdx + 1);
-        text = text.slice(colonIdx + 1);
+    const match = text.match(/^([a-z0-9_-]+(?:\[[^\]]+\])?:)/i);
+    if (match) {
+        prefix = match[1].toLowerCase();
+        text = text.slice(match[1].length);
     }
 
-    // Remove punctuation, collapse multiple spaces
     const cleanQuery = text
-        .replace(/[^a-z0-9\s]/g, "")
+        .toLocaleLowerCase("en-US")
+        .replace(/[^\p{L}\p{N}\s]/gu, "")
         .replace(/\s+/g, " ")
         .trim();
-
     return { prefix, cleanQuery };
 }
 
+/** Preserve case-sensitive direct identifiers while normalizing search text safely. */
+export function canonicalizeCacheIdentifier(subCategory: string, identifier: string): string {
+    const trimmed = identifier.trim().normalize("NFKC");
+    const spotify = canonicalizeSpotifyIdentifier(trimmed);
+    if (spotify) return spotify;
+    if (subCategory !== "search") return trimmed;
+
+    const { prefix, cleanQuery } = normalizeSearchQuery(trimmed);
+    return `${prefix}${cleanQuery}`;
+}
+
 interface FuzzyIndexEntry {
+    namespace: string;
     prefix: string;
     cleanQuery: string;
     rawIdentifier: string;
-    subCategory: string;
     addedAt: number;
+}
+
+interface MemoryEntry {
+    value: unknown;
+    expiresAt: number;
 }
 
 export class DragonflyCacheManager {
     private client: Redis | null = null;
-    private config: DragonflyCacheConfig;
-    public isConnected: boolean = false;
-    public stats: CacheStats = {
+    private readonly config: DragonflyCacheConfig;
+    public isConnected = false;
+    public readonly stats: CacheStats = {
         hits: 0,
+        memoryHits: 0,
         fuzzyHits: 0,
         misses: 0,
         writes: 0,
         evictions: 0,
         errors: 0,
+        clears: 0,
         estimatedEntries: 0,
     };
-    private writeCounter: number = 0;
+    private writeCounter = 0;
     private fuzzySearchIndex: FuzzyIndexEntry[] = [];
-    private maxFuzzyIndexSize: number = 5000;
+    private readonly maxFuzzyIndexSize = 5000;
+    private readonly memoryCache = new Map<string, MemoryEntry>();
 
     constructor(config: DragonflyCacheConfig) {
         this.config = config;
-        if (config.enabled && config.url) {
-            this.init();
-        }
+        if (config.enabled && config.url) this.init();
     }
 
     private init(): void {
         try {
-            const redisOptions: any = {
-                maxRetriesPerRequest: 2,
-                connectTimeout: 4000,
+            this.client = new Redis(this.config.url, {
+                password: this.config.password || undefined,
+                maxRetriesPerRequest: 1,
+                connectTimeout: 3000,
+                commandTimeout: this.config.commandTimeoutMs ?? 750,
                 enableReadyCheck: true,
+                enableOfflineQueue: false,
                 lazyConnect: false,
-                protocol: 2, // Use RESP2 to avoid NOAUTH HELLO issues on Redis/Dragonfly
-                retryStrategy: (times: number) => Math.min(times * 200, 3000),
-            };
+                retryStrategy: (times) => Math.min(times * 200, 3000),
+            });
 
-            if (this.config.password) {
-                redisOptions.password = this.config.password;
-            }
-
-            this.client = new Redis(this.config.url, redisOptions);
-
-            this.client.on("connect", () => {
+            this.client.on("ready", () => {
                 this.isConnected = true;
-                const safeUrl = this.config.url.replace(/:[^:@]+@/, ":***@");
-                console.log(`[DragonflyCache] Connected to Dragonfly/Redis at ${safeUrl}`);
-                this.syncEntryCount();
+                console.log(`[DragonflyCache] Ready at ${this.safeConnectionUrl()}`);
+                void this.syncEntryCount();
             });
-
-            this.client.on("error", (err) => {
+            this.client.on("close", () => {
                 this.isConnected = false;
-                this.stats.errors++;
-                console.error("[DragonflyCache] Connection error:", err.message);
             });
-        } catch (err: any) {
+            this.client.on("reconnecting", () => {
+                this.isConnected = false;
+            });
+            this.client.on("error", (error) => {
+                this.stats.errors++;
+                console.error("[DragonflyCache] Connection error:", error.message);
+            });
+        } catch (error) {
             this.stats.errors++;
-            console.error("[DragonflyCache] Failed to initialize client:", err?.message);
+            console.error("[DragonflyCache] Failed to initialize:", error instanceof Error ? error.message : error);
         }
     }
 
-    private formatKey(subCategory: string, identifier: string): string {
-        const clean = identifier.trim().toLowerCase();
-        return `${this.config.keyPrefix}:${subCategory}:${clean}`;
+    private safeConnectionUrl(): string {
+        try {
+            const url = new URL(this.config.url);
+            if (url.password) url.password = "***";
+            return url.toString();
+        } catch {
+            return "configured endpoint";
+        }
+    }
+
+    private digest(value: string): string {
+        return createHash("sha256").update(value).digest("hex");
+    }
+
+    private formatKey(subCategory: string, identifier: string, namespace = ""): string {
+        const canonical = canonicalizeCacheIdentifier(subCategory, identifier);
+        return `${this.config.keyPrefix}:v3:${subCategory}:${this.digest(`${namespace}\u0000${canonical}`)}`;
+    }
+
+    private formatLearnedRouteKey(identifier: string, namespace = ""): string {
+        const canonical = identifier.trim().normalize("NFKC");
+        return `${this.config.keyPrefix}:v3:learned_route:${this.digest(`${namespace}\u0000${canonical}`)}`;
     }
 
     private get lruIndexKey(): string {
-        return `${this.config.keyPrefix}:__lru_index`;
+        return `${this.config.keyPrefix}:v3:__lru_index`;
     }
 
-    /**
-     * Get cached value by key, with automatic Levenshtein fuzzy match fallback for search typos
-     */
-    public async get(subCategory: string, identifier: string): Promise<any | null> {
+    private getMemory(key: string): unknown | null {
+        const entry = this.memoryCache.get(key);
+        if (!entry) return null;
+        if (entry.expiresAt <= Date.now()) {
+            this.memoryCache.delete(key);
+            return null;
+        }
+        this.memoryCache.delete(key);
+        this.memoryCache.set(key, entry);
+        return entry.value;
+    }
+
+    private setMemory(key: string, value: unknown, ttlSeconds: number): void {
+        const maxEntries = this.config.memoryMaxEntries ?? 1000;
+        if (maxEntries <= 0) return;
+        const localTtl = Math.min(ttlSeconds > 0 ? ttlSeconds : 5, this.config.memoryTtlSeconds ?? 5);
+        this.memoryCache.delete(key);
+        this.memoryCache.set(key, { value, expiresAt: Date.now() + localTtl * 1000 });
+        while (this.memoryCache.size > maxEntries) {
+            const oldest = this.memoryCache.keys().next().value as string | undefined;
+            if (!oldest) break;
+            this.memoryCache.delete(oldest);
+        }
+    }
+
+    private ttlFor(subCategory: string, requested?: number): number {
+        const base = requested ?? (
+            subCategory === "search" ? this.config.searchTtlSeconds
+                : subCategory === "lyrics" ? this.config.lyricsTtlSeconds
+                    : this.config.trackTtlSeconds
+        );
+        if (base <= 0) return base;
+        const jitter = Math.min(Math.max(this.config.ttlJitterPercent ?? 0.05, 0), 0.25);
+        return Math.max(1, Math.round(base * (1 + (Math.random() * 2 - 1) * jitter)));
+    }
+
+    public async get(subCategory: string, identifier: string, namespace = ""): Promise<unknown | null> {
+        const key = this.formatKey(subCategory, identifier, namespace);
+        const memoryHit = this.getMemory(key);
+        if (memoryHit !== null) {
+            this.stats.hits++;
+            this.stats.memoryHits++;
+            return memoryHit;
+        }
+
         if (!this.isConnected || !this.client || !this.config.enabled) {
             this.stats.misses++;
             return null;
         }
+
         try {
-            // 1. Direct exact key lookup
-            const key = this.formatKey(subCategory, identifier);
             const raw = await this.client.get(key);
-            if (raw) {
+            if (raw !== null) {
+                const value: unknown = JSON.parse(raw);
                 this.stats.hits++;
-
-                // Touch LRU score on hit
+                this.setMemory(key, value, this.config.memoryTtlSeconds ?? 5);
                 if (this.config.maxCachedEntries > 0) {
-                    this.client.zadd(this.lruIndexKey, Date.now(), key).catch(() => {});
+                    void this.client.zadd(this.lruIndexKey, Date.now(), key).catch(() => undefined);
                 }
-
-                return JSON.parse(raw);
+                return value;
             }
 
-            // 2. Fuzzy / Typo match for search queries
-            if (subCategory === "search") {
-                const fuzzyHit = await this.lookupFuzzy(identifier);
+            if (subCategory === "search" && this.config.fuzzySearchEnabled === true) {
+                const fuzzyHit = await this.lookupFuzzy(identifier, namespace);
                 if (fuzzyHit) {
+                    this.stats.hits++;
                     this.stats.fuzzyHits++;
-                    // Also alias the typo query in cache for instant O(1) hits next time
-                    this.set(subCategory, identifier, fuzzyHit.data).catch(() => {});
-                    return fuzzyHit.data;
+                    void this.set(subCategory, identifier, fuzzyHit, undefined, namespace).catch(() => undefined);
+                    return fuzzyHit;
                 }
             }
 
             this.stats.misses++;
             return null;
-        } catch (err: any) {
+        } catch (error) {
             this.stats.errors++;
-            console.error(`[DragonflyCache] Error getting key for "${identifier}":`, err?.message);
+            console.error(`[DragonflyCache] GET failed: ${error instanceof Error ? error.message : error}`);
             return null;
         }
     }
 
-    /**
-     * Search the in-memory index for a typo / fuzzy match (Similarity >= 85%)
-     */
-    private async lookupFuzzy(rawIdentifier: string): Promise<{ data: any; matchedIdentifier: string; similarity: number } | null> {
+    private async lookupFuzzy(rawIdentifier: string, namespace: string): Promise<unknown | null> {
         if (!this.client || this.fuzzySearchIndex.length === 0) return null;
-
         const { prefix, cleanQuery } = normalizeSearchQuery(rawIdentifier);
-        if (cleanQuery.length < 5) return null; // Don't fuzzy-match very short queries
+        if (cleanQuery.length < 5) return null;
 
         let bestMatch: FuzzyIndexEntry | null = null;
-        let bestSimilarity = 0.85; // Require at least 85% similarity
-
+        let bestSimilarity = Math.min(Math.max(this.config.fuzzySearchThreshold ?? 0.9, 0.8), 1);
         for (const entry of this.fuzzySearchIndex) {
-            // Must have matching source prefix (e.g. dzsearch:) if specified
-            if (prefix && entry.prefix && prefix !== entry.prefix) continue;
-
-            // Length difference must be small (<= 4 chars)
+            if (namespace !== entry.namespace || prefix !== entry.prefix) continue;
             if (Math.abs(cleanQuery.length - entry.cleanQuery.length) > 4) continue;
-
             const similarity = calculateSimilarity(cleanQuery, entry.cleanQuery);
             if (similarity >= bestSimilarity) {
                 bestSimilarity = similarity;
                 bestMatch = entry;
             }
         }
+        if (!bestMatch) return null;
 
-        if (bestMatch) {
-            const key = this.formatKey("search", bestMatch.rawIdentifier);
-            const raw = await this.client.get(key);
-            if (raw) {
-                console.log(
-                    `[DragonflyCache:FuzzyMatch] Typo "${rawIdentifier}" matched "${bestMatch.rawIdentifier}" (${(bestSimilarity * 100).toFixed(1)}% match)`
-                );
-                return {
-                    data: JSON.parse(raw),
-                    matchedIdentifier: bestMatch.rawIdentifier,
-                    similarity: bestSimilarity,
-                };
-            }
+        const raw = await this.client.get(this.formatKey("search", bestMatch.rawIdentifier, namespace));
+        if (raw === null) {
+            this.fuzzySearchIndex = this.fuzzySearchIndex.filter((entry) => entry !== bestMatch);
+            return null;
         }
-
-        return null;
+        return JSON.parse(raw) as unknown;
     }
 
-    public async set(subCategory: string, identifier: string, data: any, ttlSeconds?: number): Promise<void> {
+    public async set(
+        subCategory: string,
+        identifier: string,
+        data: unknown,
+        ttlSeconds?: number,
+        namespace = ""
+    ): Promise<void> {
+        const key = this.formatKey(subCategory, identifier, namespace);
+        const ttl = this.ttlFor(subCategory, ttlSeconds);
+        this.setMemory(key, data, ttl);
+        if (subCategory === "search" && this.config.fuzzySearchEnabled === true) {
+            this.registerFuzzyEntry(identifier, namespace);
+        }
         if (!this.isConnected || !this.client || !this.config.enabled) return;
-        try {
-            const key = this.formatKey(subCategory, identifier);
-            const serialized = JSON.stringify(data);
-            const ttl = ttlSeconds ?? (subCategory === "search" ? this.config.searchTtlSeconds : this.config.trackTtlSeconds);
 
-            if (ttl > 0) {
-                await this.client.setex(key, ttl, serialized);
-            } else {
-                await this.client.set(key, serialized);
-            }
+        try {
+            const pipeline = this.client.pipeline();
+            const serialized = JSON.stringify(data);
+            if (ttl > 0) pipeline.set(key, serialized, "EX", ttl);
+            else pipeline.set(key, serialized);
+            if (this.config.maxCachedEntries > 0) pipeline.zadd(this.lruIndexKey, Date.now(), key);
+            const results = await pipeline.exec();
+            const failed = results?.find(([error]) => error);
+            if (failed?.[0]) throw failed[0];
 
             this.stats.writes++;
-            this.stats.estimatedEntries++;
-
-            // Index for fuzzy matching
-            if (subCategory === "search") {
-                this.registerFuzzyEntry(identifier, subCategory);
-            }
-
-            // Track in LRU Index and check max cached amount
             if (this.config.maxCachedEntries > 0) {
-                await this.client.zadd(this.lruIndexKey, Date.now(), key);
-
-                // Run eviction check every 50 writes
-                if (++this.writeCounter % 50 === 0) {
-                    this.enforceMaxCachedEntries().catch(() => {});
+                const zaddResult = results?.[results.length - 1]?.[1];
+                if (typeof zaddResult === "number" && zaddResult > 0) {
+                    this.stats.estimatedEntries += zaddResult;
                 }
             }
-        } catch (err: any) {
+            if (this.config.maxCachedEntries > 0 && ++this.writeCounter % 50 === 0) {
+                void this.enforceMaxCachedEntries();
+            }
+        } catch (error) {
             this.stats.errors++;
-            console.error(`[DragonflyCache] Error setting key for "${identifier}":`, err?.message);
+            console.error(`[DragonflyCache] SET failed: ${error instanceof Error ? error.message : error}`);
         }
     }
 
-    private registerFuzzyEntry(rawIdentifier: string, subCategory: string): void {
+    private registerFuzzyEntry(rawIdentifier: string, namespace: string): void {
         const { prefix, cleanQuery } = normalizeSearchQuery(rawIdentifier);
-        if (cleanQuery.length < 5) return;
-
-        // Check if already indexed
-        const existing = this.fuzzySearchIndex.find((e) => e.rawIdentifier === rawIdentifier);
+        if (!prefix || cleanQuery.length < 5) return;
+        const existing = this.fuzzySearchIndex.find(
+            (entry) => entry.rawIdentifier === rawIdentifier && entry.namespace === namespace
+        );
         if (existing) {
             existing.addedAt = Date.now();
             return;
         }
-
-        this.fuzzySearchIndex.push({
-            prefix,
-            cleanQuery,
-            rawIdentifier,
-            subCategory,
-            addedAt: Date.now(),
-        });
-
-        if (this.fuzzySearchIndex.length > this.maxFuzzyIndexSize) {
-            this.fuzzySearchIndex.shift(); // Remove oldest
-        }
+        this.fuzzySearchIndex.push({ namespace, prefix, cleanQuery, rawIdentifier, addedAt: Date.now() });
+        if (this.fuzzySearchIndex.length > this.maxFuzzyIndexSize) this.fuzzySearchIndex.shift();
     }
 
-    public async del(subCategory: string, identifier: string): Promise<void> {
+    public async del(subCategory: string, identifier: string, namespace = ""): Promise<void> {
+        const key = this.formatKey(subCategory, identifier, namespace);
+        this.memoryCache.delete(key);
+        this.fuzzySearchIndex = this.fuzzySearchIndex.filter(
+            (entry) => entry.rawIdentifier !== identifier || entry.namespace !== namespace
+        );
         if (!this.isConnected || !this.client || !this.config.enabled) return;
         try {
-            const key = this.formatKey(subCategory, identifier);
-            await this.client.del(key);
-            if (this.config.maxCachedEntries > 0) {
-                await this.client.zrem(this.lruIndexKey, key);
-            }
-            this.fuzzySearchIndex = this.fuzzySearchIndex.filter((e) => e.rawIdentifier !== identifier);
-            this.stats.estimatedEntries = Math.max(0, this.stats.estimatedEntries - 1);
-        } catch (err: any) {
+            const pipeline = this.client.pipeline().unlink(key);
+            if (this.config.maxCachedEntries > 0) pipeline.zrem(this.lruIndexKey, key);
+            await pipeline.exec();
+        } catch (error) {
             this.stats.errors++;
-            console.error(`[DragonflyCache] Error deleting key for "${identifier}":`, err?.message);
+            console.error(`[DragonflyCache] DEL failed: ${error instanceof Error ? error.message : error}`);
         }
     }
 
-    /**
-     * Enforce maxCachedEntries by evicting the oldest entries
-     */
+    public async clear(): Promise<number> {
+        this.memoryCache.clear();
+        this.fuzzySearchIndex = [];
+        if (!this.isConnected || !this.client || !this.config.enabled) return 0;
+
+        let deleted = 0;
+        for (let pass = 0; pass < 3; pass++) {
+            let cursor = "0";
+            let deletedThisPass = 0;
+            do {
+                const [nextCursor, keys] = await this.client.scan(
+                    cursor,
+                    "MATCH",
+                    `${this.config.keyPrefix}:*`,
+                    "COUNT",
+                    500
+                );
+                cursor = nextCursor;
+                if (keys.length) deletedThisPass += await this.client.unlink(...keys);
+            } while (cursor !== "0");
+            deleted += deletedThisPass;
+            if (deletedThisPass === 0) break;
+        }
+
+        this.stats.clears++;
+        this.stats.estimatedEntries = 0;
+        return deleted;
+    }
+
     private async enforceMaxCachedEntries(): Promise<void> {
         if (!this.client || !this.isConnected || this.config.maxCachedEntries <= 0) return;
         try {
             const total = await this.client.zcard(this.lruIndexKey);
             this.stats.estimatedEntries = total;
+            const excess = total - this.config.maxCachedEntries;
+            if (excess <= 0) return;
 
-            if (total > this.config.maxCachedEntries) {
-                const excess = total - this.config.maxCachedEntries;
-                const oldestKeys = await this.client.zrange(this.lruIndexKey, 0, excess - 1);
-                if (oldestKeys.length > 0) {
-                    const pipeline = this.client.pipeline();
-                    for (const key of oldestKeys) {
-                        pipeline.del(key);
-                    }
-                    pipeline.zrem(this.lruIndexKey, ...oldestKeys);
-                    await pipeline.exec();
-
-                    this.stats.evictions += oldestKeys.length;
-                    this.stats.estimatedEntries = Math.max(0, total - oldestKeys.length);
-                    console.log(`[DragonflyCache:Eviction] Evicted ${oldestKeys.length} oldest entries (Cap: ${this.config.maxCachedEntries})`);
-                }
-            }
-        } catch (err: any) {
-            console.error("[DragonflyCache:Eviction] Error during cache eviction:", err?.message);
+            const popped = await this.client.zpopmin(this.lruIndexKey, excess);
+            const keys = popped.filter((_, index) => index % 2 === 0);
+            if (keys.length) await this.client.unlink(...keys);
+            this.stats.evictions += keys.length;
+            this.stats.estimatedEntries = Math.max(0, total - keys.length);
+        } catch (error) {
+            this.stats.errors++;
+            console.error(`[DragonflyCache] Eviction failed: ${error instanceof Error ? error.message : error}`);
         }
     }
 
     private async syncEntryCount(): Promise<void> {
         if (!this.client || !this.isConnected || this.config.maxCachedEntries <= 0) return;
         try {
-            const count = await this.client.zcard(this.lruIndexKey);
-            this.stats.estimatedEntries = count;
-        } catch {}
+            this.stats.estimatedEntries = await this.client.zcard(this.lruIndexKey);
+        } catch {
+            // Cache failures are fail-open and are already surfaced by the client error event.
+        }
     }
 
-    /**
-     * Get learned fast-path route for a query that previously succeeded on a fallback cascade
-     */
-    public async getLearnedRoute(rawIdentifier: string): Promise<LearnedRoute | null> {
+    public async getLearnedRoute(rawIdentifier: string, namespace = ""): Promise<LearnedRoute | null> {
         if (!this.isConnected || !this.client || !this.config.enabled) return null;
         try {
-            const key = `${this.config.keyPrefix}:learned_route:${rawIdentifier.trim().toLowerCase()}`;
-            const raw = await this.client.get(key);
-            if (!raw) return null;
-            return JSON.parse(raw);
+            const raw = await this.client.get(this.formatLearnedRouteKey(rawIdentifier, namespace));
+            return raw ? JSON.parse(raw) as LearnedRoute : null;
         } catch {
             return null;
         }
     }
 
-    /**
-     * Save a learned fast-path route (default TTL: 7 days / 604,800s)
-     */
-    public async setLearnedRoute(rawIdentifier: string, route: LearnedRoute, ttlSeconds: number = 604800): Promise<void> {
+    public async setLearnedRoute(
+        rawIdentifier: string,
+        route: LearnedRoute,
+        ttlSeconds = 1800,
+        namespace = ""
+    ): Promise<void> {
         if (!this.isConnected || !this.client || !this.config.enabled) return;
         try {
-            const key = `${this.config.keyPrefix}:learned_route:${rawIdentifier.trim().toLowerCase()}`;
-            await this.client.setex(key, ttlSeconds, JSON.stringify(route));
-        } catch (err: any) {
-            console.error(`[DragonflyCache] Error saving learned route for "${rawIdentifier}":`, err?.message);
+            await this.client.set(this.formatLearnedRouteKey(rawIdentifier, namespace), JSON.stringify(route), "EX", ttlSeconds);
+        } catch (error) {
+            this.stats.errors++;
+            console.error(`[DragonflyCache] Learned-route write failed: ${error instanceof Error ? error.message : error}`);
         }
     }
 
-    /**
-     * Delete an invalid or stale learned route
-     */
-    public async delLearnedRoute(rawIdentifier: string): Promise<void> {
+    public async delLearnedRoute(rawIdentifier: string, namespace = ""): Promise<void> {
         if (!this.isConnected || !this.client || !this.config.enabled) return;
         try {
-            const key = `${this.config.keyPrefix}:learned_route:${rawIdentifier.trim().toLowerCase()}`;
-            await this.client.del(key);
-        } catch {}
+            await this.client.unlink(this.formatLearnedRouteKey(rawIdentifier, namespace));
+        } catch {
+            // A stale learned route will expire naturally.
+        }
+    }
+
+    public async close(): Promise<void> {
+        this.isConnected = false;
+        if (!this.client) return;
+        try {
+            await this.client.quit();
+        } catch {
+            this.client.disconnect(false);
+        } finally {
+            this.client = null;
+        }
     }
 }

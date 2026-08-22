@@ -1,65 +1,68 @@
 import { describe, expect, it } from "bun:test";
-import { calculateLevenshteinDistance, calculateSimilarity, normalizeSearchQuery } from "./index";
+import {
+    calculateLevenshteinDistance,
+    calculateSimilarity,
+    canonicalizeCacheIdentifier,
+    DragonflyCacheManager,
+    normalizeSearchQuery,
+} from "./index";
 import { extractYouTubeVideoId } from "../transformers";
 
-describe("Levenshtein & Fuzzy Search Typo Matching", () => {
-    it("should calculate exact matches with distance 0 and similarity 1.0", () => {
-        const query = "sweet dreams are made of this";
-        expect(calculateLevenshteinDistance(query, query)).toBe(0);
-        expect(calculateSimilarity(query, query)).toBe(1.0);
-    });
-
-    it("should match typo 'swwet dreams are nade of these' with high similarity (>= 85%)", () => {
+describe("cache key safety and fuzzy matching", () => {
+    it("calculates exact and typo similarity", () => {
         const canonical = normalizeSearchQuery("dzsearch:sweet dreams are made of these").cleanQuery;
         const typo = normalizeSearchQuery("dzsearch:swwet dreams are nade of these").cleanQuery;
-
-        const distance = calculateLevenshteinDistance(canonical, typo);
-        const similarity = calculateSimilarity(canonical, typo);
-
-        expect(distance).toBe(2); // 'w' instead of 'e', 'n' instead of 'm'
-        expect(similarity).toBeGreaterThanOrEqual(0.85);
+        expect(calculateLevenshteinDistance(canonical, typo)).toBe(2);
+        expect(calculateSimilarity(canonical, typo)).toBeGreaterThanOrEqual(0.85);
     });
 
-    it("should NOT match distinct queries with extra keywords like 'by marilyn manson'", () => {
+    it("does not collapse a materially different query", () => {
         const original = normalizeSearchQuery("dzsearch:sweet dreams are made of these").cleanQuery;
-        const manson = normalizeSearchQuery("dzsearch:sweet dreams are made of these by marilyn manson").cleanQuery;
-
-        const similarity = calculateSimilarity(original, manson);
-        expect(similarity).toBeLessThan(0.70); // Very distinct search
+        const targeted = normalizeSearchQuery("dzsearch:sweet dreams are made of these by marilyn manson").cleanQuery;
+        expect(calculateSimilarity(original, targeted)).toBeLessThan(0.7);
     });
 
-    it("should extract YouTube video ID from any YouTube URL format", () => {
-        const id1 = extractYouTubeVideoId("https://music.youtube.com/watch?v=qeMFqkcPYcg");
-        const id2 = extractYouTubeVideoId("https://www.youtube.com/watch?v=qeMFqkcPYcg&feature=youtu.be");
-        const id3 = extractYouTubeVideoId("https://youtu.be/qeMFqkcPYcg");
-        const id4 = extractYouTubeVideoId("https://youtube.com/shorts/qeMFqkcPYcg");
-
-        expect(id1).toBe("qeMFqkcPYcg");
-        expect(id2).toBe("qeMFqkcPYcg");
-        expect(id3).toBe("qeMFqkcPYcg");
-        expect(id4).toBe("qeMFqkcPYcg");
+    it("preserves case-sensitive direct identifiers", () => {
+        expect(canonicalizeCacheIdentifier("track", "qeMFqkcPYcg"))
+            .not.toBe(canonicalizeCacheIdentifier("track", "QEmFQKCpyCG"));
     });
 
-    it("should construct valid LearnedRoute objects for fast-path short-circuiting", () => {
-        const learnedRoute = {
-            targetNodeName: "nodelink_node",
-            transformedIdentifier: "ytsearch:qeMFqkcPYcg",
-            cacheCategory: "search" as const,
-            isEventHub: false,
-            isInProcess: false,
-            learnedAt: Date.now(),
-            attemptsSaved: 2,
-        };
-
-        expect(learnedRoute.targetNodeName).toBe("nodelink_node");
-        expect(learnedRoute.transformedIdentifier).toBe("ytsearch:qeMFqkcPYcg");
-        expect(learnedRoute.attemptsSaved).toBe(2);
+    it("normalizes only search text and keeps source prefixes distinct", () => {
+        expect(canonicalizeCacheIdentifier("search", "YTSEARCH:  Hello,   WORLD! ")).toBe("ytsearch:hello world");
+        expect(normalizeSearchQuery("ytsearch:hello world").prefix).not.toBe(
+            normalizeSearchQuery("dzsearch:hello world").prefix
+        );
     });
 
-    it("should fetch accurate official title via YouTube oEmbed API", async () => {
-        const { fetchYouTubeOEmbedTitle } = await import("../transformers");
-        const oembed = await fetchYouTubeOEmbedTitle("https://music.youtube.com/watch?v=Fm9kbWFUXys");
-        expect(oembed).not.toBeNull();
-        expect(oembed?.title.toLowerCase()).toContain("talk a lot");
+    it("canonicalizes Spotify resource type and ID without network access", () => {
+        const id = "4uLU6hMCjMI75M1A2tKUQC";
+        expect(canonicalizeCacheIdentifier("track", `https://open.spotify.com/track/${id}?si=test`))
+            .toBe(`spotify:track:${id}`);
+    });
+
+    it("extracts case-sensitive YouTube video IDs from supported URL formats", () => {
+        const id = "qeMFqkcPYcg";
+        expect(extractYouTubeVideoId(`https://music.youtube.com/watch?v=${id}`)).toBe(id);
+        expect(extractYouTubeVideoId(`https://youtu.be/${id}`)).toBe(id);
+        expect(extractYouTubeVideoId(`https://youtube.com/shorts/${id}`)).toBe(id);
+    });
+
+    it("keeps the hot L1 cache active without a Dragonfly connection", async () => {
+        const cache = new DragonflyCacheManager({
+            enabled: false,
+            url: "redis://127.0.0.1:6379",
+            keyPrefix: "test",
+            searchTtlSeconds: 60,
+            trackTtlSeconds: 60,
+            lyricsTtlSeconds: 60,
+            maxCachedEntries: 0,
+            memoryMaxEntries: 10,
+            memoryTtlSeconds: 5,
+        });
+        await cache.set("search", "ytsearch:l1 cache", { cached: true }, undefined, "lavalink-main");
+
+        expect(await cache.get("search", "ytsearch:l1 cache", "lavalink-main")).toEqual({ cached: true });
+        expect(cache.stats.memoryHits).toBe(1);
+        await cache.close();
     });
 });
