@@ -226,8 +226,8 @@ export const config: LavalinkProxyConfig = {
         // Secret token required for worker daemons to authenticate with the proxy
         authToken: process.env.EVENT_HUB_AUTH_TOKEN || proxyPassword,
 
-        // Maximum execution time in milliseconds for an EventHub worker task (default: 2500ms)
-        defaultTimeoutMs: Number(process.env.EVENT_HUB_TIMEOUT_MS || 2500),
+        // Maximum execution time in milliseconds for an EventHub worker task (default: 3500ms)
+        defaultTimeoutMs: Number(process.env.EVENT_HUB_TIMEOUT_MS || 3500),
     },
 
     /**
