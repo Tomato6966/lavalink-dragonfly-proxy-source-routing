@@ -1,41 +1,336 @@
 import type { LavalinkLoadResult, LavalinkTrack } from "../types";
 
-/**
- * Multi-Language Noise & Modifier Patterns
- * Covers English, Spanish, French, German, Portuguese, Italian, Japanese (Romaji/Kana), and Cyrillic/Russian.
- */
-const COVER_REGEX = /\b(cover|covers|tribute|tribute band|karaoke|karaokê|karaoké|acoustic|acoustique|akustik|ac[uú]stica|klavier|orchester|orchestral|piano version|instrumental|parody|8d audio|bass boosted|chipmunk|midi|bossa nova|reprise|hommage|voz e viol[aã]o|utattemita|歌ってみた|カラオケ|kaver|kover|кавер|минусовка)\b/i;
+// ─── Constants & Configuration ───────────────────────────────────────────────
 
-const REMIX_REGEX = /\b(remix|rmx|club mix|extended mix|dance mix|vip mix|bootleg|flip|mashup|slowed\s*\+?\s*reverb|slowed|sped up|nightcore|hardstyle|trap mix|drill mix|bass house|remiks|ремикс)\b/i;
+/** BM25 tuning: k1 controls term-frequency saturation, b controls length normalization */
+const BM25_K1 = 1.4;
+const BM25_B = 0.6;
 
-const LIVE_REGEX = /\b(live at|live in|live from|live on|live session|live recording|en vivo|ao vivo|en direct|live performance|live acoustic|tour edition|live concert)\b/i;
+/** Score weights for each ranking signal (tuned for music search) */
+const W = {
+    /** BM25 text relevance (title + author combined) */
+    bm25:           40,
+    /** Bigram Dice-coefficient fuzzy title similarity */
+    bigramTitle:    25,
+    /** Bigram Dice-coefficient fuzzy author similarity */
+    bigramAuthor:   18,
+    /** Exact or near-exact core title match */
+    exactTitle:     35,
+    /** Artist token overlap bonus */
+    artistMatch:    25,
+    /** Query-parsed artist name exact match */
+    artistExact:    40,
+    /** Upstream position preservation (gentle decay) */
+    positionDecay:  0.8,
+    /** Official edition bonus */
+    officialBonus:  12,
+    /** Duration in sweet-spot bonus */
+    durationBonus:  8,
+    /** ISRC dedup penalty for lower-ranked dupes */
+    isrcDupePenalty: -60,
+    /** Cover/tribute/baby penalty when unsolicited */
+    coverPenalty:   -80,
+    /** Remix/slowed/sped penalty when unsolicited */
+    remixPenalty:   -55,
+    /** Live version penalty when unsolicited */
+    livePenalty:    -30,
+    /** Compilation/various artists penalty */
+    compilationPenalty: -20,
+    /** Cover/tribute boost when user explicitly wants one */
+    coverBoost:     55,
+    /** Remix boost when user explicitly wants one */
+    remixBoost:     55,
+    /** Live boost when user explicitly wants one */
+    liveBoost:      45,
+} as const;
 
-const OFFICIAL_EDITION_REGEX = /\b(remastered|remaster|original mix|radio edit|album version|official audio|official video|studio version|single version|explicit|deluxe edition)\b/i;
+// ─── Multi-Language Noise & Modifier Patterns ────────────────────────────────
 
-/** Normalize text: lower-case, strip diacritics/accents, trim extra whitespace. */
-function normalizeString(text: string): string {
+/** Cover, tribute, karaoke, lullaby, baby, instrumental — across EN, ES, FR, DE, PT, IT, RU, JA, KO, AR, TR, PL, NL */
+const COVER_REGEX = /(?:\b(?:covers?|coversong|coverversion|tribute(?:\s+(?:band|to))?|karaoke[êé]?|klavier|orchester|orchestral|piano\s*(?:version|cover)|instrumental|parody|parodie|parodia|8d\s*audio|bass\s*boost(?:ed)?|chipmunk|midi|bossa\s*nova|reprise|hommage|voz\s*e\s*viol[aã]o|utattemita|kav[eé]r|kov[eé]r|кавер|минусовка|lullaby|lullabies|berceuse|wiegenlied|ninna\s*nanna|cancion\s*de\s*cuna|babies?\s*love|baby\s*(?:music|sleep|lullaby)|kids?|bedtime|music\s*box|soundalike|sound-alike|versione|versión)\b|歌ってみた|カラオケ|커버)/i;
+
+/** Acoustic / unplugged — separate from covers for distinct intent handling */
+const ACOUSTIC_REGEX = /\b(acoustic|acoustique|akustik|akustisk|acústica|acustica|unplugged|version\s*(?:acústica|acoustique|akustisch))\b/i;
+
+/** Remix, slowed, sped up, nightcore, bootleg, mashup */
+const REMIX_REGEX = /(?:\b(?:remix|rmx|club\s*mix|extended\s*mix|dance\s*mix|dub\s*mix|vip\s*mix|radio\s*mix|bootleg|flip|mashup|mash-up|slowed\s*(?:\+|&|and)?\s*reverb|slowed(?:\s+down)?|sped\s*up|nightcore|hardstyle|trap\s*(?:mix|remix)|drill\s*(?:mix|remix)|bass\s*house|house\s*mix|techno\s*(?:mix|remix)|trance\s*(?:mix|remix)|lofi|lo-fi|chopped\s*(?:and|&)\s*screwed|remiks|ремикс)\b|リミックス|리믹스)/i;
+
+/** Live recording indicators */
+const LIVE_REGEX = /(?:\b(?:live\s+(?:at|in|from|on|@)|live\s*session|live\s*recording|en\s*vivo|ao\s*vivo|en\s*direct|live\s*performance|live\s*acoustic|tour\s*edition|live\s*concert|live\s*version|unplugged\s*(?:live|session))\b|ライブ|라이브)/i;
+
+/** Official remaster, album version, radio edit — should NOT be penalized */
+const OFFICIAL_EDITION_REGEX = /\b(re-?master(?:ed)?|original\s*(?:mix|version|recording)|radio\s*edit|album\s*version|official\s*(?:audio|video|music\s*video)|studio\s*version|single\s*version|explicit|deluxe\s*(?:edition|version)?|anniversary\s*(?:edition|version)?|bonus\s*track|expanded\s*edition|standard\s*edition)\b/i;
+
+/** Compilation album / Various Artists indicators */
+const COMPILATION_REGEX = /\b(various\s*artists?|v\/?a\b|compilation|sampler|greatest\s*hits\s*(?:of\s*)?|best\s*of\b|top\s*(?:hits|tracks)|now\s*that'?s?\s*what\s*i\s*call|hitzone|bravo\s*hits|hit\s*parade|20\s*(?:greatest|biggest)|mega\s*hits|ultra\s*hits)\b/i;
+
+/** Featuring / collaboration tags to strip for matching purposes */
+const FEAT_REGEX = /\s*[\(\[]?\s*(?:feat\.?|ft\.?|featuring|with|prod\.?\s*by|produced\s*by|&|×|x(?=\s+[A-Z]))\s+.+$/i;
+const FEAT_STRIP_REGEX = /\s*[\(\[]?\s*(?:feat\.?|ft\.?|featuring)\s+[^\)\]]+[\)\]]?/gi;
+
+/** Common music stopwords for BM25 scoring (filtered from token significance) */
+const STOPWORDS = new Set([
+    "the", "a", "an", "of", "in", "on", "at", "to", "for", "and", "or", "by",
+    "is", "it", "my", "me", "i", "you", "we", "her", "his", "our", "your",
+    "de", "la", "le", "les", "el", "los", "das", "der", "die", "des", "du",
+    "no", "da", "do", "na", "em", "um", "una", "une", "dei", "di",
+]);
+
+// ─── String Processing Utilities ─────────────────────────────────────────────
+
+/** Normalize: lowercase, strip diacritics, collapse whitespace, trim */
+function normalize(text: string): string {
     return (text || "")
         .toLowerCase()
         .normalize("NFD")
         .replace(/[\u0300-\u036f]/g, "")
-        .replace(/[\s\-_/\\|]+/g, " ")
+        .replace(/[''`]/g, "'")
+        .replace(/[""]/g, '"')
+        .replace(/[\s\-_/\\|,;:]+/g, " ")
         .trim();
 }
 
-/** Extract clean core title ignoring parenthetical tags like (Official Video), (2011 Remaster), etc. */
+/** Extract core title: remove parenthetical tags (feat., official video, year remaster, etc.) */
 function extractCoreTitle(title: string): string {
     const cleaned = title
-        .replace(/\s*[([{](?:official|audio|video|music video|lyrics?|hd|hq|4k|remastered|remaster|\d{4})[^)\]}]*[)\]}]/gi, "")
-        .replace(/\s*[([{][^)\]}]*[)\]}]/g, "")
+        // Remove feat/ft blocks first
+        .replace(FEAT_STRIP_REGEX, "")
+        // Remove known noise parentheticals  
+        .replace(/\s*[(\[{](?:official|audio|video|music\s*video|lyrics?\s*(?:video)?|hd|hq|4k|uhd|re-?master(?:ed)?|\d{4}\s*re-?master(?:ed)?|from\s*[^)\]}]+)[)\]}]/gi, "")
+        // Remove remaining parentheticals  
+        .replace(/\s*[(\[{][^)\]}]*[)\]}]/g, "")
         .trim();
-    return normalizeString(cleaned || title);
+    return normalize(cleaned || title);
 }
 
-/** Tokenize string into a set of significant words (length >= 2). */
-function tokenize(text: string): Set<string> {
-    const words = normalizeString(text).split(/\s+/).filter(w => w.length >= 2);
-    return new Set(words);
+/** Strip featuring credits from artist name */
+function stripFeaturing(author: string): string {
+    return author
+        .replace(FEAT_REGEX, "")
+        .replace(/\s*[(\[].*[)\]]/g, "")
+        .trim();
 }
+
+/** Tokenize into significant words (length >= 2, no stopwords) */
+function tokenize(text: string): string[] {
+    return normalize(text)
+        .split(/\s+/)
+        .filter(w => w.length >= 2 && !STOPWORDS.has(w));
+}
+
+/** Tokenize keeping stopwords (for BM25 document length accuracy) */
+function tokenizeRaw(text: string): string[] {
+    return normalize(text).split(/\s+/).filter(w => w.length >= 1);
+}
+
+/** Extract character bigrams from normalized text */
+function bigrams(text: string): Set<string> {
+    const n = normalize(text);
+    const set = new Set<string>();
+    for (let i = 0; i < n.length - 1; i++) {
+        set.add(n.slice(i, i + 2));
+    }
+    return set;
+}
+
+/**
+ * Dice coefficient: 2 * |A ∩ B| / (|A| + |B|)
+ * Returns 0..1 similarity score using character bigrams.
+ * Fast O(n) with Set intersection.
+ */
+function diceCoefficient(a: string, b: string): number {
+    if (a === b) return 1;
+    const ba = bigrams(a);
+    const bb = bigrams(b);
+    if (ba.size === 0 || bb.size === 0) return 0;
+    let intersection = 0;
+    for (const bg of ba) {
+        if (bb.has(bg)) intersection++;
+    }
+    return (2 * intersection) / (ba.size + bb.size);
+}
+
+/**
+ * Jaro-Winkler similarity (prefix-weighted).
+ * Returns 0..1, where 1 is exact match.
+ * Optimized for short music titles (typically < 100 chars).
+ */
+function jaroWinkler(s1: string, s2: string): number {
+    if (s1 === s2) return 1;
+    const len1 = s1.length;
+    const len2 = s2.length;
+    if (len1 === 0 || len2 === 0) return 0;
+
+    const matchWindow = Math.max(0, Math.floor(Math.max(len1, len2) / 2) - 1);
+    const s1Matches = new Uint8Array(len1);
+    const s2Matches = new Uint8Array(len2);
+
+    let matches = 0;
+    let transpositions = 0;
+
+    for (let i = 0; i < len1; i++) {
+        const start = Math.max(0, i - matchWindow);
+        const end = Math.min(i + matchWindow + 1, len2);
+        for (let j = start; j < end; j++) {
+            if (s2Matches[j] || s1[i] !== s2[j]) continue;
+            s1Matches[i] = 1;
+            s2Matches[j] = 1;
+            matches++;
+            break;
+        }
+    }
+
+    if (matches === 0) return 0;
+
+    let k = 0;
+    for (let i = 0; i < len1; i++) {
+        if (!s1Matches[i]) continue;
+        while (!s2Matches[k]) k++;
+        if (s1[i] !== s2[k]) transpositions++;
+        k++;
+    }
+
+    const jaro = (matches / len1 + matches / len2 + (matches - transpositions / 2) / matches) / 3;
+
+    // Winkler: boost for common prefix (up to 4 chars)
+    let prefix = 0;
+    const maxPrefix = Math.min(4, Math.min(len1, len2));
+    for (let i = 0; i < maxPrefix; i++) {
+        if (s1[i] === s2[i]) prefix++;
+        else break;
+    }
+
+    return jaro + prefix * 0.1 * (1 - jaro);
+}
+
+// ─── Query Intent Parser ─────────────────────────────────────────────────────
+
+interface ParsedQuery {
+    /** Full normalized query */
+    full: string;
+    /** Query with modifiers stripped */
+    clean: string;
+    /** Parsed artist name (if detectable) */
+    artist: string;
+    /** Parsed title portion */
+    title: string;
+    /** Significant tokens (no stopwords) */
+    tokens: string[];
+    /** Raw tokens (with stopwords, for BM25 doc length) */
+    rawTokens: string[];
+    /** User intent flags */
+    wantsCover: boolean;
+    wantsRemix: boolean;
+    wantsLive: boolean;
+    wantsAcoustic: boolean;
+}
+
+/** Common query separator patterns: "artist - title", "title by artist" */
+const QUERY_SEPARATORS = /\s+[-–—]\s+|\s+by\s+/i;
+
+function parseQuery(rawIdentifier: string): ParsedQuery {
+    // Strip source prefix
+    const colonIdx = rawIdentifier.indexOf(":");
+    const queryPart = colonIdx >= 0 ? rawIdentifier.slice(colonIdx + 1) : rawIdentifier;
+
+    const full = normalize(queryPart);
+
+    // Detect user intent BEFORE stripping modifiers
+    const wantsCover = COVER_REGEX.test(full);
+    const wantsRemix = REMIX_REGEX.test(full);
+    const wantsLive = LIVE_REGEX.test(full);
+    const wantsAcoustic = /\b(acoustic|acoustique|akustik|ac[uú]stica|unplugged)\b/i.test(full);
+
+    // Strip modifiers to get clean matching query
+    let clean = full
+        .replace(COVER_REGEX, " ")
+        .replace(REMIX_REGEX, " ")
+        .replace(LIVE_REGEX, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    // Try to parse "artist - title" or "title by artist" pattern
+    let artist = "";
+    let title = clean;
+
+    const separatorMatch = clean.match(QUERY_SEPARATORS);
+    if (separatorMatch && separatorMatch.index !== undefined) {
+        const parts = clean.split(QUERY_SEPARATORS);
+        if (parts.length >= 2 && parts[0].length >= 2 && parts[1].length >= 2) {
+            // "artist - title" pattern (most common)
+            if (clean.includes(" - ") || clean.includes(" – ") || clean.includes(" — ")) {
+                artist = parts[0].trim();
+                title = parts.slice(1).join(" ").trim();
+            }
+            // "title by artist" pattern
+            else if (/\s+by\s+/i.test(clean)) {
+                title = parts[0].trim();
+                artist = parts.slice(1).join(" ").trim();
+            }
+        }
+    }
+
+    const tokens = tokenize(clean);
+    const rawTokens = tokenizeRaw(clean);
+
+    return { full, clean, artist, title, tokens, rawTokens, wantsCover, wantsRemix, wantsLive, wantsAcoustic };
+}
+
+// ─── BM25 Scoring ────────────────────────────────────────────────────────────
+
+/**
+ * Lightweight BM25 scoring for a single "document" (track metadata)
+ * against a query. Uses precomputed IDF from the track collection.
+ */
+function bm25Score(
+    queryTokens: string[],
+    docTokens: string[],
+    avgDocLen: number,
+    idfMap: Map<string, number>,
+): number {
+    const docLen = docTokens.length;
+    if (docLen === 0 || queryTokens.length === 0) return 0;
+
+    // Count term frequencies in this doc
+    const tf = new Map<string, number>();
+    for (const t of docTokens) {
+        tf.set(t, (tf.get(t) || 0) + 1);
+    }
+
+    let score = 0;
+    for (const qt of queryTokens) {
+        const freq = tf.get(qt) || 0;
+        if (freq === 0) continue;
+        const idf = idfMap.get(qt) || 0;
+        const numerator = freq * (BM25_K1 + 1);
+        const denominator = freq + BM25_K1 * (1 - BM25_B + BM25_B * (docLen / avgDocLen));
+        score += idf * (numerator / denominator);
+    }
+
+    return score;
+}
+
+/**
+ * Build IDF map from all track "documents" for the query tokens.
+ * IDF(t) = ln((N - df(t) + 0.5) / (df(t) + 0.5) + 1)
+ */
+function buildIdfMap(queryTokens: string[], documents: string[][]): Map<string, number> {
+    const N = documents.length;
+    const idf = new Map<string, number>();
+    const querySet = new Set(queryTokens);
+
+    for (const qt of querySet) {
+        let df = 0;
+        for (const doc of documents) {
+            if (doc.includes(qt)) df++;
+        }
+        idf.set(qt, Math.log((N - df + 0.5) / (df + 0.5) + 1));
+    }
+
+    return idf;
+}
+
+// ─── Main Re-Ranker ──────────────────────────────────────────────────────────
 
 export interface ReRankResult {
     result: LavalinkLoadResult;
@@ -44,11 +339,44 @@ export interface ReRankResult {
 }
 
 /**
- * Mid-Request Search Algorithm Optimization
- * Analyzes query intent, scores candidate tracks, and promotes the most relevant authentic original track to index #0.
+ * Advanced Mid-Request Search Result Optimizer
+ * 
+ * Implements a multi-signal scoring pipeline inspired by modern search engines:
+ * 
+ * 1. **BM25 Text Relevance** — term-frequency saturation + length normalization
+ *    across combined title+author document, with IDF computed from the result set.
+ * 
+ * 2. **Bigram Dice Coefficient** — fuzzy character-level similarity for resilience
+ *    against typos, transliterations, and partial matches.
+ * 
+ * 3. **Jaro-Winkler Similarity** — prefix-weighted fuzzy matching, ideal for
+ *    music titles where the beginning is usually correct.
+ * 
+ * 4. **Query Intent Parsing** — detects "artist - title" and "title by artist"
+ *    patterns. When the user includes an artist name, we give strong preference
+ *    to matching artists.
+ * 
+ * 5. **Multi-Language Noise Detection** — 15+ languages worth of cover, tribute,
+ *    karaoke, remix, slowed+reverb, lullaby, baby, kids, compilation patterns.
+ *    Inspects title, author, AND album name metadata.
+ * 
+ * 6. **Featuring Normalization** — strips "feat.", "ft.", "featuring", etc. from
+ *    both query and track metadata for cleaner matching.
+ * 
+ * 7. **ISRC Deduplication** — when multiple tracks share the same ISRC, only the
+ *    highest-scored one keeps its rank; others are heavily penalized.
+ * 
+ * 8. **Duration Curve** — graduated scoring with a bell-curve sweet spot
+ *    (90s–390s typical song), penalizing ringtone snippets and DJ sets.
+ * 
+ * 9. **Compilation/Various Artists Detection** — penalizes tracks from compilation
+ *    albums when the user likely wants the original release.
+ * 
+ * 10. **Upstream Position Preservation** — gentle index-based decay to respect the
+ *     upstream engine's ranking signal (which may encode popularity/recency).
  */
 export function optimizeSearchOrder(rawIdentifier: string, loadResult: LavalinkLoadResult): ReRankResult {
-    // Only optimize search or playlist-search results containing 2 or more tracks
+    // Only optimize search or playlist-search results with 2+ tracks
     if (loadResult.loadType !== "search" && loadResult.loadType !== "playlist") {
         return { result: loadResult, reOrdered: false, topTrackChanged: false };
     }
@@ -61,92 +389,203 @@ export function optimizeSearchOrder(rawIdentifier: string, loadResult: LavalinkL
         return { result: loadResult, reOrdered: false, topTrackChanged: false };
     }
 
-    // Strip source prefix (e.g. "spsearch:", "dzsearch:", "ytsearch:", "ytmsearch:")
-    const colonIdx = rawIdentifier.indexOf(":");
-    const queryPart = colonIdx >= 0 ? rawIdentifier.slice(colonIdx + 1) : rawIdentifier;
-    const normalizedQuery = normalizeString(queryPart);
-    const queryTokens = tokenize(normalizedQuery);
+    // ── Parse query intent ───────────────────────────────────────────────────
+    const query = parseQuery(rawIdentifier);
 
-    // Detect user's explicit intent
-    const userWantsCover = COVER_REGEX.test(normalizedQuery);
-    const userWantsRemix = REMIX_REGEX.test(normalizedQuery);
-    const userWantsLive = LIVE_REGEX.test(normalizedQuery);
-
-    const scored = rawTracks.map((track, originalIndex) => {
-        let score = 100 - originalIndex * 1.0; // Baseline preserve upstream rank
-
+    // ── Prepare track documents for BM25 ─────────────────────────────────────
+    const trackDocs: Array<{
+        track: LavalinkTrack;
+        originalIndex: number;
+        normalizedTitle: string;
+        normalizedAuthor: string;
+        normalizedAlbum: string;
+        coreTitle: string;
+        strippedAuthor: string;
+        titleTokens: string[];
+        authorTokens: string[];
+        combinedTokens: string[];
+    }> = rawTracks.map((track, idx) => {
         const rawTitle = track.info.title || "";
         const rawAuthor = track.info.author || "";
-        const normalizedTitle = normalizeString(rawTitle);
-        const normalizedAuthor = normalizeString(rawAuthor);
+        const rawAlbum = (track.pluginInfo as any)?.albumName
+            || (track.pluginInfo as any)?.album?.name
+            || (track.userData as any)?.albumName
+            || "";
+
+        const normalizedTitle = normalize(rawTitle);
+        const normalizedAuthor = normalize(rawAuthor);
+        const normalizedAlbum = normalize(rawAlbum);
         const coreTitle = extractCoreTitle(rawTitle);
-        const titleTokens = tokenize(normalizedTitle);
-        const authorTokens = tokenize(normalizedAuthor);
+        const strippedAuthor = normalize(stripFeaturing(rawAuthor));
 
-        // 1. Exact or Clean Core Title Match
-        if (coreTitle === normalizedQuery || normalizedTitle === normalizedQuery) {
-            score += 45;
-        } else if (coreTitle.startsWith(normalizedQuery) || normalizedQuery.startsWith(coreTitle)) {
-            score += 25;
-        } else {
-            // Token overlap ratio
-            let matchedTokens = 0;
-            for (const token of queryTokens) {
-                if (titleTokens.has(token) || authorTokens.has(token)) matchedTokens++;
-            }
-            const overlapRatio = queryTokens.size > 0 ? matchedTokens / queryTokens.size : 0;
-            score += Math.round(overlapRatio * 30);
-        }
+        const titleTokens = tokenize(rawTitle);
+        const authorTokens = tokenize(stripFeaturing(rawAuthor));
+        const combinedTokens = [...tokenizeRaw(rawTitle), ...tokenizeRaw(rawAuthor)];
 
-        // 2. Author/Artist Token Overlap
-        let matchedAuthorTokens = 0;
-        for (const token of queryTokens) {
-            if (authorTokens.has(token)) matchedAuthorTokens++;
-        }
-        if (matchedAuthorTokens > 0) {
-            score += Math.min(matchedAuthorTokens * 15, 30);
-        }
-
-        // 3. Modifier Intent Matching (Multi-Language)
-        const hasCoverTag = COVER_REGEX.test(rawTitle) || COVER_REGEX.test(rawAuthor);
-        const hasRemixTag = REMIX_REGEX.test(rawTitle) || REMIX_REGEX.test(rawAuthor);
-        const hasLiveTag = LIVE_REGEX.test(rawTitle) || LIVE_REGEX.test(rawAuthor);
-        const isOfficialEdition = OFFICIAL_EDITION_REGEX.test(rawTitle);
-
-        if (userWantsCover) {
-            score += hasCoverTag ? 50 : -40;
-        } else if (hasCoverTag) {
-            score -= 70;
-        }
-
-        if (userWantsRemix) {
-            score += hasRemixTag ? 50 : -40;
-        } else if (hasRemixTag && !isOfficialEdition) {
-            score -= 50;
-        }
-
-        if (userWantsLive) {
-            score += hasLiveTag ? 40 : -30;
-        } else if (hasLiveTag) {
-            score -= 30;
-        }
-
-        if (isOfficialEdition && !userWantsRemix && !userWantsCover) {
-            score += 15; // Bonus for official remaster/album version
-        }
-
-        // 4. Duration Heuristic (Favors typical song duration 1m30s - 6m30s)
-        const lengthSec = (track.info.length || 0) / 1000;
-        if (lengthSec >= 90 && lengthSec <= 390) {
-            score += 10;
-        } else if (lengthSec > 0 && (lengthSec < 50 || lengthSec > 900)) {
-            score -= 30; // Penalize short ringtones/snippets or long DJ sets
-        }
-
-        return { track, score, originalIndex };
+        return {
+            track, originalIndex: idx,
+            normalizedTitle, normalizedAuthor, normalizedAlbum,
+            coreTitle, strippedAuthor,
+            titleTokens, authorTokens, combinedTokens,
+        };
     });
 
-    // Sort tracks by highest score, preserving upstream order on ties
+    // ── BM25 preparation ─────────────────────────────────────────────────────
+    const allDocs = trackDocs.map(td => td.combinedTokens);
+    const avgDocLen = allDocs.reduce((sum, d) => sum + d.length, 0) / allDocs.length;
+    const idfMap = buildIdfMap(query.tokens, allDocs);
+
+    // ── Score each track ─────────────────────────────────────────────────────
+    const scored = trackDocs.map((td) => {
+        let score = 100; // Baseline
+
+        // ─── Signal 1: BM25 Text Relevance ──────────────────────────────
+        const bm25 = bm25Score(query.tokens, td.combinedTokens, avgDocLen, idfMap);
+        // Normalize BM25 to roughly 0..1 range (max BM25 for music metadata ≈ 8-12)
+        const bm25Normalized = Math.min(bm25 / 8, 1);
+        score += bm25Normalized * W.bm25;
+
+        // ─── Signal 2: Bigram Dice Similarity (Fuzzy) ───────────────────
+        const titleDice = diceCoefficient(query.clean, td.coreTitle);
+        score += titleDice * W.bigramTitle;
+
+        // Author fuzzy match (compare parsed artist if available, else full query)
+        const authorMatchSource = query.artist || query.clean;
+        const authorDice = diceCoefficient(authorMatchSource, td.strippedAuthor);
+        score += authorDice * W.bigramAuthor;
+
+        // ─── Signal 3: Exact / Near-Exact Title Match ───────────────────
+        const queryTitle = query.title || query.clean;
+        const jwTitle = jaroWinkler(normalize(queryTitle), td.coreTitle);
+        if (jwTitle >= 0.95) {
+            score += W.exactTitle;
+        } else if (jwTitle >= 0.85) {
+            score += W.exactTitle * 0.6;
+        } else if (jwTitle >= 0.75) {
+            score += W.exactTitle * 0.3;
+        }
+
+        // ─── Signal 4: Artist Match ─────────────────────────────────────
+        if (query.artist) {
+            // User explicitly included artist in query
+            const artistJw = jaroWinkler(normalize(query.artist), td.strippedAuthor);
+            if (artistJw >= 0.90) {
+                score += W.artistExact;
+            } else if (artistJw >= 0.80) {
+                score += W.artistExact * 0.5;
+            } else if (artistJw >= 0.70) {
+                score += W.artistExact * 0.25;
+            }
+        } else {
+            // No explicit artist: check token overlap
+            let matchedArtistTokens = 0;
+            for (const qt of query.tokens) {
+                if (td.authorTokens.includes(qt)) matchedArtistTokens++;
+            }
+            if (matchedArtistTokens > 0 && query.tokens.length > 0) {
+                const ratio = matchedArtistTokens / query.tokens.length;
+                score += ratio * W.artistMatch;
+            }
+        }
+
+        // ─── Signal 5: Noise Detection (Multi-Language) ─────────────────
+        const combinedMeta = `${td.track.info.title} ${td.track.info.author} ${td.normalizedAlbum}`;
+        const hasCoverTag = COVER_REGEX.test(combinedMeta);
+        const hasAcousticTag = ACOUSTIC_REGEX.test(combinedMeta);
+        const hasRemixTag = REMIX_REGEX.test(combinedMeta);
+        const hasLiveTag = LIVE_REGEX.test(combinedMeta);
+        const isOfficialEdition = OFFICIAL_EDITION_REGEX.test(td.track.info.title);
+        const isCompilation = COMPILATION_REGEX.test(td.track.info.author) || COMPILATION_REGEX.test(td.normalizedAlbum);
+
+        // Cover/tribute handling (separate from acoustic)
+        if (query.wantsCover) {
+            score += hasCoverTag ? W.coverBoost : -30;
+        } else if (hasCoverTag) {
+            score += W.coverPenalty;
+        }
+
+        // Acoustic/unplugged intent handling
+        if (query.wantsAcoustic) {
+            score += hasAcousticTag ? W.coverBoost : -20;
+        } else if (hasAcousticTag && !isOfficialEdition) {
+            score -= 15; // Gentle demotion for unsolicited acoustic versions
+        }
+
+        // Remix handling
+        if (query.wantsRemix) {
+            score += hasRemixTag ? W.remixBoost : -30;
+        } else if (hasRemixTag && !isOfficialEdition) {
+            score += W.remixPenalty;
+        }
+
+        // Live handling
+        if (query.wantsLive) {
+            score += hasLiveTag ? W.liveBoost : -20;
+        } else if (hasLiveTag) {
+            score += W.livePenalty;
+        }
+
+        // Official edition bonus (remasters, radio edits are authentic)
+        if (isOfficialEdition && !query.wantsRemix && !query.wantsCover) {
+            score += W.officialBonus;
+        }
+
+        // Compilation / Various Artists penalty
+        if (isCompilation) {
+            score += W.compilationPenalty;
+        }
+
+        // ─── Signal 6: Duration Heuristic (Bell Curve) ──────────────────
+        const lengthSec = (td.track.info.length || 0) / 1000;
+        if (lengthSec > 0) {
+            if (lengthSec >= 120 && lengthSec <= 330) {
+                // Sweet spot: typical pop/rock song (2–5.5 min)
+                score += W.durationBonus;
+            } else if (lengthSec >= 90 && lengthSec <= 420) {
+                // Acceptable range (1.5–7 min)
+                score += W.durationBonus * 0.5;
+            } else if (lengthSec < 50) {
+                // Ringtone / snippet / preview
+                score -= 25;
+            } else if (lengthSec > 600) {
+                // DJ set / full album / meditation track
+                score -= 15;
+            } else if (lengthSec > 900) {
+                // Very long — almost certainly not what user wants
+                score -= 35;
+            }
+        }
+
+        // ─── Signal 7: Upstream Position Decay ──────────────────────────
+        // Gently preserves upstream search engine ranking (which may encode popularity)
+        score -= td.originalIndex * W.positionDecay;
+
+        return { track: td.track, score, originalIndex: td.originalIndex, isrc: td.track.info.isrc };
+    });
+
+    // ── ISRC Deduplication Pass ───────────────────────────────────────────────
+    // If multiple tracks share the same ISRC, keep only the highest-scored one.
+    const seenIsrcs = new Map<string, number>(); // isrc -> best score
+    for (const s of scored) {
+        if (s.isrc && s.isrc.length >= 8) {
+            const normalizedIsrc = s.isrc.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+            const existing = seenIsrcs.get(normalizedIsrc);
+            if (existing === undefined || s.score > existing) {
+                seenIsrcs.set(normalizedIsrc, s.score);
+            }
+        }
+    }
+    for (const s of scored) {
+        if (s.isrc && s.isrc.length >= 8) {
+            const normalizedIsrc = s.isrc.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+            const bestScore = seenIsrcs.get(normalizedIsrc);
+            if (bestScore !== undefined && s.score < bestScore) {
+                s.score += W.isrcDupePenalty;
+            }
+        }
+    }
+
+    // ── Sort by final score (ties broken by original upstream position) ──────
     scored.sort((a, b) => b.score - a.score || a.originalIndex - b.originalIndex);
 
     const reorderedTracks = scored.map(s => s.track);
