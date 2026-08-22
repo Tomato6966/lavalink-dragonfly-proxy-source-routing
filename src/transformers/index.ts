@@ -1,6 +1,8 @@
 import type { LavalinkLoadResult } from "../types";
 import { buildEmptyResult } from "../builders";
 
+export * from "./searchReRanker";
+
 /**
  * Extract YouTube Video ID from any YouTube / YouTube Music URL
  */

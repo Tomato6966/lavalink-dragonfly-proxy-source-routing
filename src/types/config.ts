@@ -65,6 +65,7 @@ export interface RemappingConfig {
     maxRecursionDepth: number;
     routeLearning?: boolean;
     routeLearningTtlSeconds?: number;
+    searchReRankingEnabled?: boolean;
     preRequest: PreRequestRule[];
     postRequestOnFail: PostRequestOnFailRule[];
 }

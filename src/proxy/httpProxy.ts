@@ -4,6 +4,7 @@ import { classifyIdentifier, type FallbackFailureContext, type UpstreamRouter } 
 import type { EventHubManager } from "../eventHub";
 import { buildEmptyResult, buildErrorResult } from "../builders";
 import { isLavalinkLoadResult, isPlayableLoadResult } from "../validation/lavalink";
+import { optimizeSearchOrder } from "../transformers";
 
 function formatTimestamp(): string {
     const date = new Date();
@@ -767,6 +768,21 @@ export class HttpProxyHandler {
             });
 
             if (attemptSucceeded && resultData) {
+                // Mid-Request Search Algorithm Optimization (re-rank cover/tribute/remix noise)
+                if (
+                    this.config.remapping.searchReRankingEnabled !== false &&
+                    (resultData.loadType === "search" || resultData.loadType === "playlist")
+                ) {
+                    const reRank = optimizeSearchOrder(rawIdentifier, resultData);
+                    if (reRank.reOrdered) {
+                        resultData = reRank.result;
+                        if (reRank.topTrackChanged && this.config.logging.logRoutes) {
+                            const newTop = this.summarizeLoadResult(resultData);
+                            console.log(`[${formatTimestamp()}] [Proxy:ReRank] Optimized search order for "${rawIdentifier}" -> Promoted top track: "${newTop?.title || ''}" by "${newTop?.author || ''}"`);
+                        }
+                    }
+                }
+
                 const currentCategory = classifyIdentifier(currentIdentifier);
                 await Promise.all([
                     this.cache.set(currentCategory, currentIdentifier, resultData, undefined, playbackEncodingScope),
