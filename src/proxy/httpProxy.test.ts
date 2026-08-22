@@ -79,6 +79,7 @@ describe("HTTP proxy controls and coalescing", () => {
             service: string;
             health: { status: string; cacheReady: boolean };
             stats: { cacheConnected: boolean; configuredUpstreams: string[] };
+            traces: unknown[];
         };
 
         expect(response.status).toBe(200);
@@ -87,6 +88,12 @@ describe("HTTP proxy controls and coalescing", () => {
         expect(body.health.cacheReady).toBe(true);
         expect(body.stats.cacheConnected).toBe(false);
         expect(body.stats.configuredUpstreams).toEqual(["default"]);
+        expect(Array.isArray(body.traces)).toBe(true);
+
+        const tracesRes = await handler.handleRequest(request("/proxy/traces?limit=10"));
+        expect(tracesRes.status).toBe(200);
+        const tracesBody = await tracesRes.json() as { traces: unknown[] };
+        expect(Array.isArray(tracesBody.traces)).toBe(true);
     });
 
     it("makes cache clearing an authenticated POST with real deletion", async () => {

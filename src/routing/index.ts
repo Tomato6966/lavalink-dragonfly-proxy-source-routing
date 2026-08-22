@@ -9,6 +9,7 @@ export interface PreRequestResult {
     targetNode: UpstreamNodeConfig;
     isRemapped: boolean;
     appliedRule?: PreRequestRule;
+    appliedRules: PreRequestRule[];
     cacheCategory: CacheCategory;
 }
 
@@ -82,12 +83,14 @@ export class UpstreamRouter {
         let targetNodeName = "default";
         let isRemapped = false;
         let appliedRule: PreRequestRule | undefined;
+        const appliedRules: PreRequestRule[] = [];
 
         if (!identifier) {
             return {
                 transformedIdentifier: rawIdentifier,
                 targetNode: this.getNode("default"),
                 isRemapped: false,
+                appliedRules: [],
                 cacheCategory: "other",
             };
         }
@@ -96,6 +99,7 @@ export class UpstreamRouter {
             for (const rule of this.config.remapping.preRequest) {
                 if (!matchesRule(rule, identifier)) continue;
                 appliedRule = rule;
+                appliedRules.push(rule);
 
                 if (rule.prefix && rule.rewritePrefix && identifier.startsWith(rule.prefix)) {
                     const rewritten = rule.rewritePrefix + identifier.slice(rule.prefix.length);
@@ -120,6 +124,7 @@ export class UpstreamRouter {
             targetNode: this.getNode(targetNodeName),
             isRemapped,
             appliedRule,
+            appliedRules,
             cacheCategory: classifyIdentifier(identifier),
         };
     }

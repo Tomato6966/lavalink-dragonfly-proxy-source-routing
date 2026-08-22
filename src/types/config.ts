@@ -107,6 +107,40 @@ export interface ProxyServerConfig {
     websocketMaxQueueBytes?: number;
 }
 
+export interface CascadeAttemptTrace {
+    attempt: number;
+    target: string;
+    identifier: string;
+    durationMs: number;
+    status: number;
+    success: boolean;
+    loadType?: string;
+    error?: string;
+}
+
+export interface RoutingTrace {
+    id: string;
+    timestamp: number;
+    rawIdentifier: string;
+    finalIdentifier: string;
+    category: "search" | "track" | "lyrics" | "other";
+    cacheStatus: "HIT" | "MISS" | "COALESCED";
+    appliedRules: string[];
+    attempts: CascadeAttemptTrace[];
+    finalTarget: string;
+    success: boolean;
+    status: number;
+    durationMs: number;
+    resultSummary?: {
+        loadType: string;
+        trackCount?: number;
+        title?: string;
+        author?: string;
+        sourceName?: string;
+    };
+    error?: string;
+}
+
 export interface LavalinkProxyConfig {
     server: ProxyServerConfig;
     dragonfly: DragonflyCacheConfig;
@@ -122,5 +156,7 @@ export interface LavalinkProxyConfig {
         logMisses: boolean;
         logRoutes: boolean;
         logFallbacks: boolean;
+        maxTraces?: number;
     };
 }
+

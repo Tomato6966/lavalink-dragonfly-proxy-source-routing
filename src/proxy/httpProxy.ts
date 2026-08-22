@@ -1,4 +1,4 @@
-import type { LavalinkProxyConfig, UpstreamNodeConfig, LavalinkLoadResult, LavalinkTrack } from "../types";
+import type { LavalinkProxyConfig, UpstreamNodeConfig, LavalinkLoadResult, LavalinkTrack, RoutingTrace, CascadeAttemptTrace } from "../types";
 import type { DragonflyCacheManager } from "../cache";
 import { classifyIdentifier, type FallbackFailureContext, type UpstreamRouter } from "../routing";
 import type { EventHubManager } from "../eventHub";
@@ -39,6 +39,7 @@ export class HttpProxyHandler {
     private readonly startTime = Date.now();
     private readonly inFlightLoads = new Map<string, Promise<ProxyResult>>();
     private readonly circuits = new Map<string, CircuitState>();
+    private readonly traces: RoutingTrace[] = [];
     private readonly runtimeStats: RuntimeStats = {
         coalescedRequests: 0,
         rejectedRequests: 0,
@@ -61,6 +62,58 @@ export class HttpProxyHandler {
 
     public updateConfig(newConfig: LavalinkProxyConfig): void {
         this.config = newConfig;
+    }
+
+    private recordTrace(trace: RoutingTrace): void {
+        const max = this.config.logging.maxTraces ?? 100;
+        this.traces.unshift(trace);
+        if (this.traces.length > max) {
+            this.traces.length = max;
+        }
+    }
+
+    public getTraces(limit: number = 50): RoutingTrace[] {
+        return this.traces.slice(0, Math.max(1, Math.min(limit, 200)));
+    }
+
+    private summarizeLoadResult(resultData: LavalinkLoadResult | null): RoutingTrace["resultSummary"] {
+        if (!resultData) return undefined;
+        if (resultData.loadType === "track") {
+            const track = (resultData as any).data;
+            return {
+                loadType: "track",
+                trackCount: 1,
+                title: track?.info?.title,
+                author: track?.info?.author,
+                sourceName: track?.info?.sourceName,
+            };
+        }
+        if (resultData.loadType === "search") {
+            const tracks = Array.isArray((resultData as any).data) ? (resultData as any).data : [];
+            const first = tracks[0];
+            return {
+                loadType: "search",
+                trackCount: tracks.length,
+                title: first?.info?.title,
+                author: first?.info?.author,
+                sourceName: first?.info?.sourceName,
+            };
+        }
+        if (resultData.loadType === "playlist") {
+            const pl = (resultData as any).data;
+            const tracks = pl?.tracks || [];
+            const first = tracks[0];
+            return {
+                loadType: "playlist",
+                trackCount: tracks.length,
+                title: pl?.info?.name || first?.info?.title,
+                author: first?.info?.author,
+                sourceName: first?.info?.sourceName,
+            };
+        }
+        return {
+            loadType: resultData.loadType,
+        };
     }
 
     public async handleRequest(req: Request): Promise<Response> {
@@ -88,6 +141,19 @@ export class HttpProxyHandler {
                 timestamp: Date.now(),
                 health: this.healthSnapshot(),
                 stats: this.statsSnapshot(),
+                traces: this.getTraces(50),
+            });
+        }
+
+        if (pathname === "/proxy/traces") {
+            if (req.method !== "GET") {
+                return Response.json({ error: "Method Not Allowed" }, { status: 405, headers: { Allow: "GET" } });
+            }
+            const limit = Math.min(Math.max(1, Number(url.searchParams.get("limit") || 50)), 200);
+            return Response.json({
+                service: "lavalink-dragonfly-proxy",
+                timestamp: Date.now(),
+                traces: this.getTraces(limit),
             });
         }
 
@@ -488,13 +554,32 @@ export class HttpProxyHandler {
             return { data: { error: "Missing identifier parameter" }, status: 400 };
         }
 
+        const traceId = `tr_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+        const cascadeAttempts: CascadeAttemptTrace[] = [];
         const playbackEncodingScope = this.encodingScope(this.config.upstreams.default);
         const rawCategory = classifyIdentifier(rawIdentifier);
+
         const initialCached = await this.cache.get(rawCategory, rawIdentifier, playbackEncodingScope) as LavalinkLoadResult | null;
         if (initialCached && this.isValidLoadResult(initialCached)) {
+            const took = (performance.now() - requestStartedAt).toFixed(2);
             if (this.config.logging.logHits) {
-                console.log(`[${formatTimestamp()}] [Proxy:Cache:HIT] ${rawCategory} (${(performance.now() - requestStartedAt).toFixed(2)}ms)`);
+                console.log(`[${formatTimestamp()}] [Proxy:Cache:HIT] ${rawCategory} "${rawIdentifier}" (${took}ms)`);
             }
+            this.recordTrace({
+                id: traceId,
+                timestamp: Date.now(),
+                rawIdentifier,
+                finalIdentifier: rawIdentifier,
+                category: rawCategory,
+                cacheStatus: "HIT",
+                appliedRules: [],
+                attempts: [],
+                finalTarget: "cache",
+                success: true,
+                status: 200,
+                durationMs: Math.round(performance.now() - requestStartedAt),
+                resultSummary: this.summarizeLoadResult(initialCached),
+            });
             return {
                 data: initialCached,
                 status: 200,
@@ -503,7 +588,7 @@ export class HttpProxyHandler {
         }
 
         if (this.config.logging.logMisses) {
-            console.log(`[${formatTimestamp()}] [Proxy:Cache:MISS] ${rawCategory}`);
+            console.log(`[${formatTimestamp()}] [Proxy:Cache:MISS] ${rawCategory} "${rawIdentifier}"`);
         }
 
         const preResult = await this.router.applyPreRequest(rawIdentifier);
@@ -514,10 +599,34 @@ export class HttpProxyHandler {
         let handlerName: string | undefined;
         let attemptTimeoutMs: number | undefined;
         let attemptEncodingScope = this.encodingScope(targetNode);
+        const appliedRules = preResult.appliedRules.map((r) => r.name || "rule");
+
+        if (preResult.isRemapped && this.config.logging.logRoutes) {
+            console.log(`[${formatTimestamp()}] [Proxy:Remap] "${rawIdentifier}" -> "${currentIdentifier}" (rules: ${appliedRules.join(", ")})`);
+        }
 
         if (preResult.isRemapped) {
             const remappedCached = await this.cache.get(preResult.cacheCategory, currentIdentifier, playbackEncodingScope) as LavalinkLoadResult | null;
             if (remappedCached && this.isValidLoadResult(remappedCached)) {
+                const took = (performance.now() - requestStartedAt).toFixed(2);
+                if (this.config.logging.logHits) {
+                    console.log(`[${formatTimestamp()}] [Proxy:Cache:HIT] ${preResult.cacheCategory} "${currentIdentifier}" (remapped from "${rawIdentifier}") (${took}ms)`);
+                }
+                this.recordTrace({
+                    id: traceId,
+                    timestamp: Date.now(),
+                    rawIdentifier,
+                    finalIdentifier: currentIdentifier,
+                    category: preResult.cacheCategory,
+                    cacheStatus: "HIT",
+                    appliedRules,
+                    attempts: [],
+                    finalTarget: "cache",
+                    success: true,
+                    status: 200,
+                    durationMs: Math.round(performance.now() - requestStartedAt),
+                    resultSummary: this.summarizeLoadResult(remappedCached),
+                });
                 return {
                     data: remappedCached,
                     status: 200,
@@ -540,6 +649,9 @@ export class HttpProxyHandler {
                 handlerName = learned.handlerName;
                 attemptEncodingScope = learnedEncodingScope;
                 usedLearnedFastPath = true;
+                if (this.config.logging.logRoutes) {
+                    console.log(`[${formatTimestamp()}] [Proxy:RouteLearning:HIT] "${rawIdentifier}" fast-routed to ${learned.targetNodeName} as "${currentIdentifier}"`);
+                }
             } else if (learned && learnedEncodingScope !== playbackEncodingScope) {
                 await this.cache.delLearnedRoute(rawIdentifier, playbackEncodingScope);
             }
@@ -560,9 +672,11 @@ export class HttpProxyHandler {
             attempt++;
             let resultData: LavalinkLoadResult | null = null;
             let attemptSucceeded = false;
+            const attemptStart = performance.now();
+            const targetName = isEventHub ? `eventhub:${handlerName}` : isInProcess ? `inprocess:${handlerName}` : targetNode.id;
 
             if (this.config.logging.logRoutes) {
-                console.log(`[${formatTimestamp()}] [Proxy:Cascade:${attempt}] ${isEventHub ? `eventhub:${handlerName}` : targetNode.id}`);
+                console.log(`[${formatTimestamp()}] [Proxy:Cascade:${attempt}] Target: ${targetName} | Query: "${currentIdentifier}"`);
             }
 
             if (isEventHub && handlerName) {
@@ -596,7 +710,7 @@ export class HttpProxyHandler {
                 resultData = null;
                 failure = {
                     originalIdentifier: rawIdentifier,
-                    message: `Invalid Lavalink load result from ${isEventHub ? `eventhub:${handlerName}` : targetNode.id}`,
+                    message: `Invalid Lavalink load result from ${targetName}`,
                     isEmpty: false,
                     httpStatus: 502,
                 };
@@ -614,7 +728,7 @@ export class HttpProxyHandler {
                         originalIdentifier: rawIdentifier,
                         message: resultData.loadType === "error"
                             ? resultData.data.message
-                            : isEmptyResult ? failure.message : "Backend returned non-playable encoded tracks",
+                            : isEmptyResult ? failure.message || "Empty track result" : "Backend returned non-playable encoded tracks",
                         isEmpty: isEmptyResult,
                         httpStatus: lastHttpStatus,
                         loadType,
@@ -639,6 +753,18 @@ export class HttpProxyHandler {
                 };
                 lastHttpStatus = 502;
             }
+
+            const attemptDuration = Math.round(performance.now() - attemptStart);
+            cascadeAttempts.push({
+                attempt,
+                target: targetName,
+                identifier: currentIdentifier,
+                durationMs: attemptDuration,
+                status: lastHttpStatus,
+                success: attemptSucceeded,
+                loadType: (resultData as any)?.loadType,
+                error: attemptSucceeded ? undefined : failure.message,
+            });
 
             if (attemptSucceeded && resultData) {
                 const currentCategory = classifyIdentifier(currentIdentifier);
@@ -666,12 +792,35 @@ export class HttpProxyHandler {
                     }, this.config.remapping.routeLearningTtlSeconds ?? 1800, playbackEncodingScope);
                 }
 
+                const totalDuration = Math.round(performance.now() - requestStartedAt);
+                const summary = this.summarizeLoadResult(resultData);
+                if (this.config.logging.logRoutes) {
+                    const desc = summary?.title ? `"${summary.title}" (${summary.trackCount || 1} track(s))` : `${resultData.loadType}`;
+                    console.log(`[${formatTimestamp()}] [Proxy:Success] "${rawIdentifier}" resolved via ${targetName} in ${totalDuration}ms -> ${desc}`);
+                }
+
+                this.recordTrace({
+                    id: traceId,
+                    timestamp: Date.now(),
+                    rawIdentifier,
+                    finalIdentifier: currentIdentifier,
+                    category: currentCategory,
+                    cacheStatus: "MISS",
+                    appliedRules,
+                    attempts: cascadeAttempts,
+                    finalTarget: targetName,
+                    success: true,
+                    status: 200,
+                    durationMs: totalDuration,
+                    resultSummary: summary,
+                });
+
                 return {
                     data: resultData,
                     status: 200,
                     headers: {
                         "X-Proxy-Cache": "MISS",
-                        "X-Proxy-Node": isEventHub ? `eventhub:${handlerName}` : targetNode.id,
+                        "X-Proxy-Node": targetName,
                         "X-Proxy-Attempts": String(attempt),
                         "X-Proxy-Resolved-Identifier": encodeURIComponent(currentIdentifier).slice(0, 512),
                         ...(usedLearnedFastPath ? { "X-Proxy-Learned-Route": "HIT" } : {}),
@@ -693,7 +842,17 @@ export class HttpProxyHandler {
 
             lastResponseData = resultData;
             const fallback = await this.router.getNextFallback(currentIdentifier, failure, usedRuleNames);
-            if (!fallback) break;
+            if (!fallback) {
+                if (this.config.logging.logFallbacks) {
+                    console.log(`[${formatTimestamp()}] [Proxy:Fallback:End] No more fallback rules match for "${currentIdentifier}" (attempts: ${attempt})`);
+                }
+                break;
+            }
+
+            if (this.config.logging.logFallbacks) {
+                const nextTargetName = fallback.isEventHub ? `eventhub:${fallback.handlerName}` : fallback.targetNode.id;
+                console.log(`[${formatTimestamp()}] [Proxy:Fallback:${attempt}] Triggered rule "${fallback.rule.name}" -> Next Target: ${nextTargetName} | Next Query: "${fallback.nextIdentifier}" (reason: ${failure.message || (failure.isEmpty ? "empty result" : "error")})`);
+            }
 
             usedRuleNames.add(fallback.rule.name);
             currentIdentifier = fallback.nextIdentifier;
@@ -704,6 +863,26 @@ export class HttpProxyHandler {
             attemptTimeoutMs = fallback.timeoutMs;
             attemptEncodingScope = fallback.encodingScope;
         }
+
+        const totalDuration = Math.round(performance.now() - requestStartedAt);
+        const finalTargetName = targetNode?.id || "unknown";
+        console.error(`[${formatTimestamp()}] [Proxy:Fail] "${rawIdentifier}" failed after ${attempt} attempts (${totalDuration}ms): ${failure.message}`);
+
+        this.recordTrace({
+            id: traceId,
+            timestamp: Date.now(),
+            rawIdentifier,
+            finalIdentifier: currentIdentifier,
+            category: classifyIdentifier(currentIdentifier),
+            cacheStatus: "MISS",
+            appliedRules,
+            attempts: cascadeAttempts,
+            finalTarget: finalTargetName,
+            success: false,
+            status: lastHttpStatus || 502,
+            durationMs: totalDuration,
+            error: failure.message || `Proxy failed after ${attempt} attempts`,
+        });
 
         if (lastResponseData) return { data: lastResponseData, status: lastHttpStatus };
         return {
