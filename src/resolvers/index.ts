@@ -1,6 +1,8 @@
 import ytsr from "@distube/ytsr";
 import { parse as parseSpotifyUri } from "spotify-uri";
 
+export * from "./searchBridge";
+
 export interface MetadataResolverContext {
     originalIdentifier: string;
     timeoutMs: number;

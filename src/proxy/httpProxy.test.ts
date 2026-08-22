@@ -270,4 +270,60 @@ describe("HTTP proxy controls and coalescing", () => {
         expect(res1.status).toBe(200);
         expect(decodeCalls).toBe(1);
     });
+
+    it("serves live configuration snapshot via GET /proxy/config", async () => {
+        const { handler } = createHandler();
+        const response = await handler.handleRequest(request("/proxy/config"));
+        expect(response.status).toBe(200);
+        const body = await response.json() as any;
+        expect(body.server.port).toBe(2332);
+        expect(body.remapping.enabled).toBe(true);
+        expect(body.upstreams.default.id).toBe("default");
+    });
+
+    it("updates configuration live at runtime via PATCH /proxy/config", async () => {
+        const { handler } = createHandler();
+        let notifiedConfig: any = null;
+        handler.onConfigUpdated = (cfg) => {
+            notifiedConfig = cfg;
+        };
+
+        const response = await handler.handleRequest(request("/proxy/config", {
+            method: "PATCH",
+            body: JSON.stringify({
+                mode: "temporary",
+                server: { primaryPlaybackNode: "nodelink_backup" },
+                remapping: { deezerYtmBridgeEnabled: true, maskSourceToRequested: true },
+            }),
+        }));
+
+        expect(response.status).toBe(200);
+        const body = await response.json() as any;
+        expect(body.success).toBe(true);
+        expect(body.mode).toBe("temporary");
+        expect(body.config.server.primaryPlaybackNode).toBe("nodelink_backup");
+        expect(body.config.remapping.deezerYtmBridgeEnabled).toBe(true);
+        expect(notifiedConfig?.server?.primaryPlaybackNode).toBe("nodelink_backup");
+    });
+
+    it("routes playback to designated primaryPlaybackNode and playerRouting rules", () => {
+        const config = makeConfig();
+        config.upstreams.nodelink = { id: "nodelink_node", url: "http://127.0.0.1:2334" };
+        config.upstreams.vip_node = { id: "vip_lavalink", url: "http://127.0.0.1:2335" };
+        config.server.primaryPlaybackNode = "nodelink";
+        config.server.playerRouting = [
+            { guildId: "999999999", routeToNode: "vip_node" },
+            { guildIdMatch: "^vip_", routeToNode: "vip_node" },
+        ];
+
+        const { handler } = createHandler(config);
+
+        // 1. Guild ID match -> VIP node
+        expect(handler.getPlaybackNode("/v4/sessions/sess1/players/999999999").id).toBe("vip_lavalink");
+        expect(handler.getPlaybackNode("/v4/sessions/sess1/players/vip_guild_123").id).toBe("vip_lavalink");
+
+        // 2. Unmatched guild ID -> primary playback node (nodelink)
+        expect(handler.getPlaybackNode("/v4/sessions/sess1/players/123456").id).toBe("nodelink_node");
+        expect(handler.getPlaybackNode().id).toBe("nodelink_node");
+    });
 });

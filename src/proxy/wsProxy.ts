@@ -30,7 +30,11 @@ export class WebSocketProxyHandler {
     }
 
     public onOpen(ws: ProxyWebSocket, requestHeaders: Record<string, string>): void {
-        const defaultNode: UpstreamNodeConfig = this.config.upstreams.default;
+        const primaryName = this.config.server.primaryPlaybackNode;
+        const defaultNode: UpstreamNodeConfig =
+            primaryName && this.config.upstreams[primaryName]?.enabled !== false
+                ? this.config.upstreams[primaryName]
+                : this.config.upstreams.default;
         const upstreamUrl = defaultNode.wsUrl || `${defaultNode.url.replace(/^http/, "ws").replace(/\/$/, "")}/v4/websocket`;
         const upstreamHeaders: Record<string, string> = {
             Authorization: defaultNode.password || this.config.server.password,

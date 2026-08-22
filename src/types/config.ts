@@ -66,6 +66,8 @@ export interface RemappingConfig {
     routeLearning?: boolean;
     routeLearningTtlSeconds?: number;
     searchReRankingEnabled?: boolean;
+    maskSourceToRequested?: boolean;
+    deezerYtmBridgeEnabled?: boolean;
     preRequest: PreRequestRule[];
     postRequestOnFail: PostRequestOnFailRule[];
 }
@@ -97,6 +99,12 @@ export interface DragonflyCacheConfig {
     ttlJitterPercent?: number;
 }
 
+export interface PlayerRoutingRule {
+    guildId?: string;
+    guildIdMatch?: string;
+    routeToNode: string;
+}
+
 export interface ProxyServerConfig {
     port: number;
     host: string;
@@ -106,6 +114,19 @@ export interface ProxyServerConfig {
     maxInFlightRequests?: number;
     websocketMaxQueueMessages?: number;
     websocketMaxQueueBytes?: number;
+    /** Upstream node ID/name in `upstreams` used primarily for player updates and playback (defaults to "default"). */
+    primaryPlaybackNode?: string;
+    /** Rules for auto-routing player sessions / voice playback to specific nodes by guildId or pattern. */
+    playerRouting?: PlayerRoutingRule[];
+}
+
+export interface RuntimeConfigUpdateRequest {
+    mode?: "temporary" | "permanent";
+    server?: Partial<ProxyServerConfig>;
+    dragonfly?: Partial<DragonflyCacheConfig>;
+    remapping?: Partial<RemappingConfig>;
+    upstreams?: Record<string, Partial<UpstreamNodeConfig>>;
+    logging?: Partial<LavalinkProxyConfig["logging"]>;
 }
 
 export interface CascadeAttemptTrace {
@@ -117,6 +138,16 @@ export interface CascadeAttemptTrace {
     success: boolean;
     loadType?: string;
     error?: string;
+}
+
+export interface BridgeFlowTrace {
+    bridgedFrom: string;
+    intermediateQuery: string;
+    intermediateResult?: string;
+    finalTarget: string;
+    isSourceMasked: boolean;
+    originalSource: string;
+    actualSource: string;
 }
 
 export interface RoutingTrace {
@@ -132,6 +163,7 @@ export interface RoutingTrace {
     success: boolean;
     status: number;
     durationMs: number;
+    bridgeFlow?: BridgeFlowTrace;
     resultSummary?: {
         loadType: string;
         trackCount?: number;

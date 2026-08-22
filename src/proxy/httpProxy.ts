@@ -1,10 +1,11 @@
-import type { LavalinkProxyConfig, UpstreamNodeConfig, LavalinkLoadResult, LavalinkTrack, RoutingTrace, CascadeAttemptTrace } from "../types";
+import type { LavalinkProxyConfig, UpstreamNodeConfig, LavalinkLoadResult, LavalinkTrack, RoutingTrace, CascadeAttemptTrace, RuntimeConfigUpdateRequest } from "../types";
 import type { DragonflyCacheManager } from "../cache";
 import { classifyIdentifier, type FallbackFailureContext, type UpstreamRouter } from "../routing";
 import type { EventHubManager } from "../eventHub";
 import { buildEmptyResult, buildErrorResult } from "../builders";
 import { isLavalinkLoadResult, isPlayableLoadResult } from "../validation/lavalink";
 import { optimizeSearchOrder } from "../transformers";
+import { resolveYtmToDeezerBridge, applySourceMasking } from "../resolvers";
 
 function formatTimestamp(): string {
     const date = new Date();
@@ -61,8 +62,47 @@ export class HttpProxyHandler {
         this.eventHub = eventHub;
     }
 
+    public onConfigUpdated?: (newConfig: LavalinkProxyConfig) => void;
+
     public updateConfig(newConfig: LavalinkProxyConfig): void {
         this.config = newConfig;
+    }
+
+    /**
+     * Resolve the target upstream node for player sessions, voice audio, or playback
+     * based on primaryPlaybackNode and dynamic playerRouting rules.
+     */
+    public getPlaybackNode(pathname?: string, guildId?: string): UpstreamNodeConfig {
+        if (this.config.server.playerRouting && Array.isArray(this.config.server.playerRouting)) {
+            let gId = guildId;
+            if (!gId && pathname) {
+                const match = pathname.match(/\/players\/([^/?#]+)/);
+                if (match) gId = match[1];
+            }
+            if (gId) {
+                for (const rule of this.config.server.playerRouting) {
+                    if (rule.guildId && rule.guildId === gId) {
+                        const target = this.config.upstreams[rule.routeToNode];
+                        if (target && target.enabled !== false) return target;
+                    }
+                    if (rule.guildIdMatch) {
+                        try {
+                            if (new RegExp(rule.guildIdMatch, "i").test(gId)) {
+                                const target = this.config.upstreams[rule.routeToNode];
+                                if (target && target.enabled !== false) return target;
+                            }
+                        } catch {}
+                    }
+                }
+            }
+        }
+
+        const primaryName = this.config.server.primaryPlaybackNode;
+        if (primaryName && this.config.upstreams[primaryName] && this.config.upstreams[primaryName].enabled !== false) {
+            return this.config.upstreams[primaryName];
+        }
+
+        return this.config.upstreams.default;
     }
 
     private recordTrace(trace: RoutingTrace): void {
@@ -133,6 +173,23 @@ export class HttpProxyHandler {
             return Response.json(this.statsSnapshot());
         }
 
+        if (pathname === "/proxy/config") {
+            if (req.method === "GET") {
+                return Response.json(this.getConfigSnapshot());
+            }
+            if (req.method === "PATCH" || req.method === "POST") {
+                return this.handleConfigUpdate(req);
+            }
+            return Response.json({ error: "Method Not Allowed" }, { status: 405, headers: { Allow: "GET, PATCH, POST" } });
+        }
+
+        if (pathname === "/proxy/config/reset") {
+            if (req.method !== "POST") {
+                return Response.json({ error: "Method Not Allowed" }, { status: 405, headers: { Allow: "POST" } });
+            }
+            return this.handleConfigReset();
+        }
+
         if (pathname === "/proxy/monitoring") {
             if (req.method !== "GET") {
                 return Response.json({ error: "Method Not Allowed" }, { status: 405, headers: { Allow: "GET" } });
@@ -142,6 +199,7 @@ export class HttpProxyHandler {
                 timestamp: Date.now(),
                 health: this.healthSnapshot(),
                 stats: this.statsSnapshot(),
+                config: this.getConfigSnapshot(),
                 traces: this.getTraces(50),
             });
         }
@@ -193,7 +251,8 @@ export class HttpProxyHandler {
             return response;
         }
 
-        const response = await this.forwardGenericRequest(req, this.config.upstreams.default, url);
+        const targetNode = pathname.startsWith("/v4/sessions") ? this.getPlaybackNode(pathname) : this.config.upstreams.default;
+        const response = await this.forwardGenericRequest(req, targetNode, url);
         if (this.config.logging.logRoutes) {
             const took = (performance.now() - requestStartedAt).toFixed(2);
             console.log(`[${formatTimestamp()}] [Proxy:REST] ${req.method} ${pathname} -> ${response.status} (${took}ms)`);
@@ -225,6 +284,122 @@ export class HttpProxyHandler {
             circuitBreakers: this.circuitSnapshot(),
             remappingEnabled: this.config.remapping.enabled,
         };
+    }
+
+    public getConfigSnapshot(): Record<string, any> {
+        const sanitizedUpstreams: Record<string, any> = {};
+        for (const [name, node] of Object.entries(this.config.upstreams)) {
+            sanitizedUpstreams[name] = {
+                id: node.id,
+                url: node.url,
+                wsUrl: node.wsUrl,
+                priority: node.priority,
+                enabled: node.enabled !== false,
+                encodingScope: node.encodingScope,
+                requestTimeoutMs: node.requestTimeoutMs,
+                failureThreshold: node.failureThreshold,
+                circuitBreakerResetMs: node.circuitBreakerResetMs,
+                hasPassword: Boolean(node.password),
+            };
+        }
+
+        return {
+            server: {
+                port: this.config.server.port,
+                host: this.config.server.host,
+                primaryPlaybackNode: this.config.server.primaryPlaybackNode || "default",
+                playerRouting: this.config.server.playerRouting || [],
+                upstreamRequestTimeoutMs: this.config.server.upstreamRequestTimeoutMs,
+                maxLoadResultBytes: this.config.server.maxLoadResultBytes,
+                maxInFlightRequests: this.config.server.maxInFlightRequests,
+            },
+            dragonfly: {
+                enabled: this.config.dragonfly.enabled,
+                url: this.config.dragonfly.url,
+                keyPrefix: this.config.dragonfly.keyPrefix,
+                searchTtlSeconds: this.config.dragonfly.searchTtlSeconds,
+                trackTtlSeconds: this.config.dragonfly.trackTtlSeconds,
+                lyricsTtlSeconds: this.config.dragonfly.lyricsTtlSeconds,
+                fuzzySearchEnabled: this.config.dragonfly.fuzzySearchEnabled,
+                fuzzySearchThreshold: this.config.dragonfly.fuzzySearchThreshold,
+                maxCachedEntries: this.config.dragonfly.maxCachedEntries,
+            },
+            remapping: {
+                enabled: this.config.remapping.enabled,
+                deezerYtmBridgeEnabled: this.config.remapping.deezerYtmBridgeEnabled !== false,
+                searchReRankingEnabled: this.config.remapping.searchReRankingEnabled !== false,
+                maskSourceToRequested: this.config.remapping.maskSourceToRequested !== false,
+                routeLearning: this.config.remapping.routeLearning !== false,
+                routeLearningTtlSeconds: this.config.remapping.routeLearningTtlSeconds,
+                maxRecursionDepth: this.config.remapping.maxRecursionDepth,
+                preRequestRuleCount: this.config.remapping.preRequest?.length || 0,
+                postRequestRuleCount: this.config.remapping.postRequestOnFail?.length || 0,
+            },
+            upstreams: sanitizedUpstreams,
+            logging: this.config.logging,
+        };
+    }
+
+    private async handleConfigUpdate(req: Request): Promise<Response> {
+        let body: RuntimeConfigUpdateRequest;
+        try {
+            body = await req.json();
+        } catch {
+            return Response.json({ error: "Invalid JSON request body" }, { status: 400 });
+        }
+
+        const mode = body.mode || "temporary";
+        const { deepMerge, validateConfig, saveConfigOverwrites } = await import("../config");
+
+        try {
+            const updatedConfig = validateConfig(deepMerge(this.config, body as any));
+            this.updateConfig(updatedConfig);
+            this.router.updateConfig(updatedConfig);
+            if (this.onConfigUpdated) {
+                this.onConfigUpdated(updatedConfig);
+            }
+
+            if (mode === "permanent") {
+                await saveConfigOverwrites(body as any);
+                console.log(`[${formatTimestamp()}] [Proxy:Config:PERM] Saved permanent configuration overrides to config.overwrites.ts`);
+            } else {
+                console.log(`[${formatTimestamp()}] [Proxy:Config:TEMP] Applied temporary runtime configuration overrides`);
+            }
+
+            return Response.json({
+                success: true,
+                mode,
+                message: mode === "permanent"
+                    ? "Configuration updated and saved permanently to config.overwrites.ts"
+                    : "Configuration updated temporarily in runtime memory",
+                config: this.getConfigSnapshot(),
+            });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return Response.json({ error: `Config update failed: ${message}` }, { status: 400 });
+        }
+    }
+
+    private async handleConfigReset(): Promise<Response> {
+        const { loadConfig, clearConfigOverwrites } = await import("../config");
+        try {
+            await clearConfigOverwrites();
+            const reloaded = await loadConfig();
+            this.updateConfig(reloaded);
+            this.router.updateConfig(reloaded);
+            if (this.onConfigUpdated) {
+                this.onConfigUpdated(reloaded);
+            }
+            console.log(`[${formatTimestamp()}] [Proxy:Config:RESET] Reverted configuration to base config.ts`);
+            return Response.json({
+                success: true,
+                message: "Configuration reset to base config.ts and overrides cleared",
+                config: this.getConfigSnapshot(),
+            });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return Response.json({ error: `Config reset failed: ${message}` }, { status: 500 });
+        }
     }
 
     private authenticate(req: Request, pathname: string): Response | null {
@@ -658,6 +833,104 @@ export class HttpProxyHandler {
             }
         }
 
+        // Intelligent Search Bridge: on dzsearch: query, route through YTM for popularity-ranked metadata, then resolve Deezer
+        if (
+            this.config.remapping.deezerYtmBridgeEnabled !== false &&
+            rawIdentifier.toLowerCase().startsWith("dzsearch:") &&
+            !usedLearnedFastPath
+        ) {
+            const bridgeStart = performance.now();
+            const bridge = await resolveYtmToDeezerBridge(rawIdentifier, async (id) => {
+                const up = await this.loadFromUpstream(req, url, this.config.upstreams.default, id);
+                return up.data;
+            });
+
+            if (bridge.success && bridge.result && this.isValidLoadResult(bridge.result)) {
+                let resultData = bridge.result;
+                const totalDuration = Math.round(performance.now() - requestStartedAt);
+                const bridgeDuration = Math.round(performance.now() - bridgeStart);
+
+                // Re-ranking
+                if (this.config.remapping.searchReRankingEnabled !== false && (resultData.loadType === "search" || resultData.loadType === "playlist")) {
+                    const reRank = optimizeSearchOrder(rawIdentifier, resultData);
+                    if (reRank.reOrdered) resultData = reRank.result;
+                }
+
+                // Source Masking ("Source Illusion")
+                const maskEnabled = this.config.remapping.maskSourceToRequested !== false;
+                resultData = applySourceMasking(resultData, rawIdentifier, maskEnabled);
+
+                // Cache both raw and intermediate identifiers
+                await Promise.all([
+                    this.cache.set(rawCategory, rawIdentifier, resultData, undefined, playbackEncodingScope),
+                    bridge.intermediateQuery
+                        ? this.cache.set(classifyIdentifier(bridge.intermediateQuery), bridge.intermediateQuery, resultData, undefined, playbackEncodingScope)
+                        : Promise.resolve(),
+                ]);
+
+                const summary = this.summarizeLoadResult(resultData);
+                if (this.config.logging.logRoutes) {
+                    console.log(`[${formatTimestamp()}] [Proxy:Bridge] "${rawIdentifier}" resolved via ${bridge.finalTarget} (from ${bridge.bridgedFrom} -> ${bridge.intermediateQuery || 'direct'}) in ${bridgeDuration}ms -> "${summary?.title || ''}" by "${summary?.author || ''}"`);
+                }
+
+                const trace: RoutingTrace = {
+                    id: traceId,
+                    timestamp: Date.now(),
+                    rawIdentifier,
+                    finalIdentifier: bridge.intermediateQuery || rawIdentifier,
+                    category: rawCategory,
+                    cacheStatus: "MISS",
+                    appliedRules: ["deezerYtmBridge", ...appliedRules],
+                    attempts: [
+                        {
+                            attempt: 1,
+                            target: "ytm_search",
+                            identifier: bridge.bridgedFrom,
+                            durationMs: Math.round(bridgeDuration / 2),
+                            status: 200,
+                            success: true,
+                            loadType: "search",
+                        },
+                        {
+                            attempt: 2,
+                            target: bridge.finalTarget === "deezer" ? "lavalink_deezer" : "lavalink_ytm_fallback",
+                            identifier: bridge.intermediateQuery || rawIdentifier,
+                            durationMs: Math.round(bridgeDuration / 2),
+                            status: 200,
+                            success: true,
+                            loadType: resultData.loadType,
+                        },
+                    ],
+                    finalTarget: bridge.finalTarget,
+                    success: true,
+                    status: 200,
+                    durationMs: totalDuration,
+                    bridgeFlow: {
+                        bridgedFrom: bridge.bridgedFrom,
+                        intermediateQuery: bridge.intermediateQuery,
+                        intermediateResult: bridge.intermediateResultTitle,
+                        finalTarget: bridge.finalTarget,
+                        isSourceMasked: maskEnabled,
+                        originalSource: "deezer",
+                        actualSource: bridge.finalTarget,
+                    },
+                    resultSummary: summary,
+                };
+                this.recordTrace(trace);
+
+                return {
+                    data: resultData,
+                    status: 200,
+                    headers: {
+                        "X-Proxy-Cache": "MISS",
+                        "X-Proxy-Node": bridge.finalTarget,
+                        "X-Proxy-Bridge": "ytm-deezer",
+                        "X-Proxy-Resolved-Identifier": encodeURIComponent(bridge.intermediateQuery || rawIdentifier).slice(0, 512),
+                    },
+                };
+            }
+        }
+
         const maxDepth = Math.max(1, this.config.remapping.maxRecursionDepth || 4);
         const usedRuleNames = new Set<string>();
         let lastResponseData: LavalinkLoadResult | null = null;
@@ -782,6 +1055,10 @@ export class HttpProxyHandler {
                         }
                     }
                 }
+
+                // Source Masking ("Source Illusion")
+                const maskEnabled = this.config.remapping.maskSourceToRequested !== false;
+                resultData = applySourceMasking(resultData, rawIdentifier, maskEnabled);
 
                 const currentCategory = classifyIdentifier(currentIdentifier);
                 await Promise.all([

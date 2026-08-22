@@ -21,6 +21,9 @@ async function main(): Promise<void> {
     const eventHub = new EventHubManager(config.eventHub);
     const httpHandler = new HttpProxyHandler(config, cacheManager, router, eventHub);
     const wsProxy = new WebSocketProxyHandler(config);
+    httpHandler.onConfigUpdated = (newConfig) => {
+        wsProxy.updateConfig(newConfig);
+    };
     const pendingUpgradeHeaders = new Map<string, Record<string, string>>();
 
     const server = Bun.serve<WsClientData>({
