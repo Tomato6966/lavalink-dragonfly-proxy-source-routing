@@ -173,32 +173,20 @@ export class UpstreamNodePool {
      * configured explicit routing rules, or fallback strategy.
      */
     public getNodeForPlayback(guildId?: string): UpstreamNodeConfig {
-        if (guildId) {
-            // 1. Check explicit playerRouting rules first (if any)
-            if (this.config.server.playerRouting?.length) {
-                for (const rule of this.config.server.playerRouting) {
-                    if (rule.guildId && rule.guildId === guildId) {
-                        const target = this.getNodeByName(rule.routeToNode);
-                        if (target && target.enabled !== false) return target;
-                    }
-                    if (rule.guildIdMatch) {
-                        try {
-                            if (new RegExp(rule.guildIdMatch, "i").test(guildId)) {
-                                const target = this.getNodeByName(rule.routeToNode);
-                                if (target && target.enabled !== false) return target;
-                            }
-                        } catch {}
-                    }
+        if (guildId && this.config.server.playerRouting?.length) {
+            // Check explicit playerRouting rules first
+            for (const rule of this.config.server.playerRouting) {
+                if (rule.guildId && rule.guildId === guildId) {
+                    const target = this.getNodeByName(rule.routeToNode);
+                    if (target && target.enabled !== false) return target;
                 }
-            }
-
-            // 2. Consistent Hash Ring: automatic uniform distribution across all healthy nodes
-            const strategy = this.config.cluster?.strategy || "consistent-hash";
-            if (strategy === "consistent-hash") {
-                const selectedId = this.hashRing.getNode(guildId);
-                if (selectedId) {
-                    const node = this.getNodeByName(selectedId);
-                    if (node && node.enabled !== false) return node;
+                if (rule.guildIdMatch) {
+                    try {
+                        if (new RegExp(rule.guildIdMatch, "i").test(guildId)) {
+                            const target = this.getNodeByName(rule.routeToNode);
+                            if (target && target.enabled !== false) return target;
+                        }
+                    } catch {}
                 }
             }
         }

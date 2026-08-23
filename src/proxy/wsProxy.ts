@@ -103,9 +103,9 @@ export class WebSocketProxyHandler {
                         op = parsed.op;
                     } catch {}
 
-                    // Session ready handling: ensure primary session ID is established once
+                    // Session ready handling: ensure primary session ID is established once from primary node
                     if (op === "ready") {
-                        if (isPrimary || !hasForwardedReady) {
+                        if (isPrimary && !hasForwardedReady) {
                             hasForwardedReady = true;
                             ws.send(event.data);
                         }
