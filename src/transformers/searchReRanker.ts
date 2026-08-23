@@ -34,6 +34,8 @@ const W = {
     remixPenalty:   -55,
     /** Live version penalty when unsolicited */
     livePenalty:    -30,
+    /** Soundtrack / OST / Cast penalty when unsolicited */
+    soundtrackPenalty: -45,
     /** Compilation/various artists penalty */
     compilationPenalty: -20,
     /** Cover/tribute boost when user explicitly wants one */
@@ -42,12 +44,20 @@ const W = {
     remixBoost:     55,
     /** Live boost when user explicitly wants one */
     liveBoost:      45,
+    /** Soundtrack / OST / Cast boost when user explicitly wants one */
+    soundtrackBoost: 40,
 } as const;
 
 // ─── Multi-Language Noise & Modifier Patterns ────────────────────────────────
 
 /** Cover, tribute, karaoke, lullaby, baby, instrumental — across EN, ES, FR, DE, PT, IT, RU, JA, KO, AR, TR, PL, NL */
 const COVER_REGEX = /(?:\b(?:covers?|coversong|coverversion|tribute(?:\s+(?:band|to))?|karaoke[êé]?|klavier|orchester|orchestral|piano\s*(?:version|cover)|instrumental|parody|parodie|parodia|8d\s*audio|bass\s*boost(?:ed)?|chipmunk|midi|bossa\s*nova|reprise|hommage|voz\s*e\s*viol[aã]o|utattemita|kav[eé]r|kov[eé]r|кавер|минусовка|lullaby|lullabies|berceuse|wiegenlied|ninna\s*nanna|cancion\s*de\s*cuna|babies?\s*love|baby\s*(?:music|sleep|lullaby)|kids?|bedtime|music\s*box|soundalike|sound-alike|versione|versión)\b|歌ってみた|カラオケ|커버)/i;
+
+/** Acoustic / brass band / marching band / ensemble covers & tributes */
+const ENSEMBLE_NOISE_REGEX = /\b(brass\s*band|marching\s*band|orchestral\s*tribute|string\s*quartet|tribute\s*band|party\s*band|steel\s*drum\s*band|big\s*band\s*tribute|tribute\s*orchestra|backing\s*track)\b/i;
+
+/** Soundtrack, Broadway cast recording, film score, motion picture OST */
+const SOUNDTRACK_REGEX = /\b(from the (?:motion picture|soundtrack|film|musical|series|netflix\s*series|movie)|soundtrack(?:\s*(?:version|album))?|original\s*(?:broadway\s*)?cast(?:\s*recording)?|cast\s*(?:recording|version)|ost\b|motion\s*picture\s*score|music\s*from\s+the\s+(?:motion\s*picture|film|series|movie))\b/i;
 
 /** Acoustic / unplugged — separate from covers for distinct intent handling */
 const ACOUSTIC_REGEX = /\b(acoustic|acoustique|akustik|akustisk|acústica|acustica|unplugged|version\s*(?:acústica|acoustique|akustisch))\b/i;
@@ -56,7 +66,7 @@ const ACOUSTIC_REGEX = /\b(acoustic|acoustique|akustik|akustisk|acústica|acusti
 const REMIX_REGEX = /(?:\b(?:remix|rmx|club\s*mix|extended\s*mix|dance\s*mix|dub\s*mix|vip\s*mix|radio\s*mix|bootleg|flip|mashup|mash-up|slowed\s*(?:\+|&|and)?\s*reverb|slowed(?:\s+down)?|sped\s*up|nightcore|hardstyle|trap\s*(?:mix|remix)|drill\s*(?:mix|remix)|bass\s*house|house\s*mix|techno\s*(?:mix|remix)|trance\s*(?:mix|remix)|lofi|lo-fi|chopped\s*(?:and|&)\s*screwed|remiks|ремикс)\b|リミックス|리믹스)/i;
 
 /** Live recording indicators */
-const LIVE_REGEX = /(?:\b(?:live\s+(?:at|in|from|on|@)|live\s*session|live\s*recording|en\s*vivo|ao\s*vivo|en\s*direct|live\s*performance|live\s*acoustic|tour\s*edition|live\s*concert|live\s*version|unplugged\s*(?:live|session))\b|ライブ|라이브)/i;
+const LIVE_REGEX = /(?:\b(?:live\s+(?:at|in|from|on|@)|live\s*session|live\s*recording|en\s*vivo|ao\s*vivo|en\s*direct|live\s*performance|live\s*acoustic|tour\s*edition|live\s*concert|live\s*version|unplugged\s*(?:live|session))\b|ライブ|ライ브)/i;
 
 /** Official remaster, album version, radio edit — should NOT be penalized */
 const OFFICIAL_EDITION_REGEX = /\b(re-?master(?:ed)?|original\s*(?:mix|version|recording)|radio\s*edit|album\s*version|official\s*(?:audio|video|music\s*video)|studio\s*version|single\s*version|explicit|deluxe\s*(?:edition|version)?|anniversary\s*(?:edition|version)?|bonus\s*track|expanded\s*edition|standard\s*edition)\b/i;
@@ -75,6 +85,40 @@ const STOPWORDS = new Set([
     "de", "la", "le", "les", "el", "los", "das", "der", "die", "des", "du",
     "no", "da", "do", "na", "em", "um", "una", "une", "dei", "di",
 ]);
+
+// ─── Homophone & Typo Normalization ──────────────────────────────────────────
+
+/**
+ * Music homophones, common title/artist misspellings, and typo replacements
+ */
+const HOMOPHONE_REPLACEMENTS: Array<[RegExp, string]> = [
+    [/\bloose\s+yourself\b/gi, "lose yourself"],
+    [/\bloose\s+control\b/gi, "lose control"],
+    [/\bloose\s+my\s+mind\b/gi, "lose my mind"],
+    [/\bloose\s+you\b/gi, "lose you"],
+    [/\bloose\s+it\b/gi, "lose it"],
+    [/\bloose\s+my\s+breath\b/gi, "lose my breath"],
+    [/\b(don'?t|cant|can'?t|never|wanna|going\s+to|gonna)\s+loose\b/gi, "$1 lose"],
+    [/\blooser\b/gi, "loser"],
+    [/\bstills\s+tanding\b/gi, "still standing"],
+    [/\bclam\s+down\b/gi, "calm down"],
+    [/\bdefinately\b/gi, "definitely"],
+    [/\bpersuit\b/gi, "pursuit"],
+    [/\bseperate\b/gi, "separate"],
+    [/\bunforgetable\b/gi, "unforgettable"],
+];
+
+/**
+ * Pre-scoring query normalizer for high-frequency music homophones and common typos
+ */
+export function normalizeMusicHomophones(text: string): string {
+    if (!text) return "";
+    let result = text;
+    for (const [pattern, replacement] of HOMOPHONE_REPLACEMENTS) {
+        result = result.replace(pattern, replacement);
+    }
+    return result;
+}
 
 // ─── String Processing Utilities ─────────────────────────────────────────────
 
@@ -95,8 +139,10 @@ function extractCoreTitle(title: string): string {
     const cleaned = title
         // Remove feat/ft blocks first
         .replace(FEAT_STRIP_REGEX, "")
-        // Remove known noise parentheticals  
-        .replace(/\s*[([{](?:official|audio|video|music\s*video|lyrics?\s*(?:video)?|hd|hq|4k|uhd|re-?master(?:ed)?|\d{4}\s*re-?master(?:ed)?|from\s*[^)\]}]+)[)\]}]/gi, "")
+        // Remove known noise parentheticals and soundtrack tags
+        .replace(/\s*[([{](?:official|audio|video|music\s*video|lyrics?\s*(?:video)?|hd|hq|4k|uhd|re-?master(?:ed)?|\d{4}\s*re-?master(?:ed)?|from\s*[^)\]}]+|soundtrack\s*version)[)\]}]/gi, "")
+        // Remove trailing " - From ..." or " - Single" or " - Soundtrack..."
+        .replace(/\s*-\s*(?:from\s+[^-\n]+|single|soundtrack.*)$/i, "")
         // Remove remaining parentheticals  
         .replace(/\s*[([{][^)\]}]*[)\]}]/g, "")
         .trim();
@@ -223,6 +269,7 @@ interface ParsedQuery {
     wantsRemix: boolean;
     wantsLive: boolean;
     wantsAcoustic: boolean;
+    wantsSoundtrack: boolean;
 }
 
 /** Common query separator patterns: "artist - title", "title by artist" */
@@ -233,19 +280,24 @@ function parseQuery(rawIdentifier: string): ParsedQuery {
     const colonIdx = rawIdentifier.indexOf(":");
     const queryPart = colonIdx >= 0 ? rawIdentifier.slice(colonIdx + 1) : rawIdentifier;
 
-    const full = normalize(queryPart);
+    const homophoneNormalized = normalizeMusicHomophones(queryPart);
+    const full = normalize(homophoneNormalized);
 
     // Detect user intent BEFORE stripping modifiers
-    const wantsCover = COVER_REGEX.test(full);
+    const wantsCover = COVER_REGEX.test(full) || ENSEMBLE_NOISE_REGEX.test(full);
     const wantsRemix = REMIX_REGEX.test(full);
     const wantsLive = LIVE_REGEX.test(full);
     const wantsAcoustic = /\b(acoustic|acoustique|akustik|ac[uú]stica|unplugged)\b/i.test(full);
+    const wantsSoundtrack = SOUNDTRACK_REGEX.test(full) || /\b(soundtrack|ost|cast|movie|film|score)\b/i.test(full);
 
     // Strip modifiers to get clean matching query
     let clean = full
         .replace(COVER_REGEX, " ")
+        .replace(ENSEMBLE_NOISE_REGEX, " ")
         .replace(REMIX_REGEX, " ")
         .replace(LIVE_REGEX, " ")
+        .replace(SOUNDTRACK_REGEX, " ")
+        .replace(/\b(soundtrack|ost|cast|movie|film|score)\b/gi, " ")
         .replace(/\s+/g, " ")
         .trim();
 
@@ -273,7 +325,7 @@ function parseQuery(rawIdentifier: string): ParsedQuery {
     const tokens = tokenize(clean);
     const rawTokens = tokenizeRaw(clean);
 
-    return { full, clean, artist, title, tokens, rawTokens, wantsCover, wantsRemix, wantsLive, wantsAcoustic };
+    return { full, clean, artist, title, tokens, rawTokens, wantsCover, wantsRemix, wantsLive, wantsAcoustic, wantsSoundtrack };
 }
 
 // ─── BM25 Scoring ────────────────────────────────────────────────────────────
@@ -490,10 +542,11 @@ export function optimizeSearchOrder(rawIdentifier: string, loadResult: LavalinkL
 
         // ─── Signal 5: Noise Detection (Multi-Language) ─────────────────
         const combinedMeta = `${td.track.info.title} ${td.track.info.author} ${td.normalizedAlbum}`;
-        const hasCoverTag = COVER_REGEX.test(combinedMeta);
+        const hasCoverTag = COVER_REGEX.test(combinedMeta) || ENSEMBLE_NOISE_REGEX.test(combinedMeta);
         const hasAcousticTag = ACOUSTIC_REGEX.test(combinedMeta);
         const hasRemixTag = REMIX_REGEX.test(combinedMeta);
         const hasLiveTag = LIVE_REGEX.test(combinedMeta);
+        const hasSoundtrackTag = SOUNDTRACK_REGEX.test(combinedMeta);
         const isOfficialEdition = OFFICIAL_EDITION_REGEX.test(td.track.info.title);
         const isCompilation = COMPILATION_REGEX.test(td.track.info.author) || COMPILATION_REGEX.test(td.normalizedAlbum);
 
@@ -502,6 +555,13 @@ export function optimizeSearchOrder(rawIdentifier: string, loadResult: LavalinkL
             score += hasCoverTag ? W.coverBoost : -30;
         } else if (hasCoverTag) {
             score += W.coverPenalty;
+        }
+
+        // Soundtrack / OST handling
+        if (query.wantsSoundtrack) {
+            score += hasSoundtrackTag ? W.soundtrackBoost : -20;
+        } else if (hasSoundtrackTag) {
+            score += W.soundtrackPenalty;
         }
 
         // Acoustic/unplugged intent handling
@@ -526,7 +586,7 @@ export function optimizeSearchOrder(rawIdentifier: string, loadResult: LavalinkL
         }
 
         // Official edition bonus (remasters, radio edits are authentic)
-        if (isOfficialEdition && !query.wantsRemix && !query.wantsCover) {
+        if (isOfficialEdition && !query.wantsRemix && !query.wantsCover && !hasSoundtrackTag) {
             score += W.officialBonus;
         }
 

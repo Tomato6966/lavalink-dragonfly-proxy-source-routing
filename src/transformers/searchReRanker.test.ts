@@ -428,4 +428,105 @@ describe("Advanced Search Re-Ranker v2", () => {
             expect(topTrack(result.result).info.author).toBe("Adele");
         });
     });
+
+    describe("Soundtrack / Cast vs Original Studio Master", () => {
+        it("promotes Elton John original studio master over Taron Egerton Rocketman OST for 'i\\'m still standing'", () => {
+            const result = optimizeSearchOrder("dzsearch:i'm still standing", searchResult([
+                createTrack("I'm Still Standing (From \"Rocketman\" Soundtrack)", "Taron Egerton", 230000, { albumName: "Rocketman (Music From The Motion Picture)" }),
+                createTrack("I'm Still Standing", "Elton John", 183000, { albumName: "Too Low For Zero" }),
+            ]));
+
+            expect(result.topTrackChanged).toBe(true);
+            expect(topTrack(result.result).info.author).toBe("Elton John");
+        });
+
+        it("promotes soundtrack cast recording when user explicitly queries for soundtrack", () => {
+            const result = optimizeSearchOrder("dzsearch:i'm still standing rocketman soundtrack", searchResult([
+                createTrack("I'm Still Standing", "Elton John", 183000, { albumName: "Too Low For Zero" }),
+                createTrack("I'm Still Standing (From \"Rocketman\" Soundtrack)", "Taron Egerton", 230000, { albumName: "Rocketman (Music From The Motion Picture)" }),
+            ]));
+
+            expect(topTrack(result.result).info.author).toBe("Taron Egerton");
+        });
+
+        it("demotes broadway cast recordings when user searches for solo artist master", () => {
+            const result = optimizeSearchOrder("dzsearch:defying gravity idina menzel", searchResult([
+                createTrack("Defying Gravity", "Original Broadway Cast", 353000, { albumName: "Wicked (Original Broadway Cast Recording)" }),
+                createTrack("Defying Gravity", "Idina Menzel", 353000, { albumName: "I Stand" }),
+            ]));
+
+            expect(topTrack(result.result).info.author).toBe("Idina Menzel");
+        });
+    });
+
+    describe("Brass Band & Ensemble Noise Demotion", () => {
+        it("demotes High & Mighty Brass Band in favor of Blackstreet for 'no diggity'", () => {
+            const result = optimizeSearchOrder("spsearch:no diggity", searchResult([
+                createTrack("No Diggity", "High & Mighty Brass Band", 220000),
+                createTrack("No Diggity (feat. Dr. Dre, Queen Pen)", "Blackstreet", 305000, { albumName: "Another Level" }),
+            ]));
+
+            expect(result.topTrackChanged).toBe(true);
+            expect(topTrack(result.result).info.author).toBe("Blackstreet");
+        });
+
+        it("demotes string quartet and marching band tributes", () => {
+            const result = optimizeSearchOrder("spsearch:bad guy billie eilish", searchResult([
+                createTrack("Bad Guy (String Quartet Tribute)", "Vitamin String Quartet", 195000),
+                createTrack("Bad Guy (Marching Band)", "Ohio Marching Band", 180000),
+                createTrack("bad guy", "Billie Eilish", 194000, { albumName: "WHEN WE ALL FALL ASLEEP, WHERE DO WE GO?" }),
+            ]));
+
+            expect(topTrack(result.result).info.author).toBe("Billie Eilish");
+        });
+    });
+
+    describe("Homophone & Spell Normalization", () => {
+        it("normalizes 'loose yourself' to match Eminem's 'Lose Yourself' over obscure house track", () => {
+            const result = optimizeSearchOrder("spsearch:loose yourself", searchResult([
+                createTrack("Loose Yourself", "Block & Crown", 310000, { albumName: "Club Ibiza" }),
+                createTrack("Lose Yourself", "Eminem", 326000, { albumName: "8 Mile" }),
+            ]));
+
+            expect(result.topTrackChanged).toBe(true);
+            expect(topTrack(result.result).info.author).toBe("Eminem");
+        });
+
+        it("normalizes 'loose control' to match Teddy Swims 'Lose Control'", () => {
+            const result = optimizeSearchOrder("spsearch:loose control", searchResult([
+                createTrack("Loose Control (House Mix)", "DJ Remixer", 240000),
+                createTrack("Lose Control", "Teddy Swims", 210000, { albumName: "I've Tried Everything But Therapy" }),
+            ]));
+
+            expect(result.topTrackChanged).toBe(true);
+            expect(topTrack(result.result).info.author).toBe("Teddy Swims");
+        });
+
+        it("normalizes 'looser' to 'loser' for Tame Impala / Beck queries", () => {
+            const result = optimizeSearchOrder("ytmsearch:looser tame impala", searchResult([
+                createTrack("Other Song", "Random Artist", 200000),
+                createTrack("Loser", "Tame Impala", 215000),
+            ]));
+
+            expect(topTrack(result.result).info.author).toBe("Tame Impala");
+        });
+
+        it("normalizes 'stills tanding' to 'still standing' for Elton John", () => {
+            const result = optimizeSearchOrder("spsearch:stills tanding elton john", searchResult([
+                createTrack("Standing Still", "Jewel", 270000),
+                createTrack("I'm Still Standing", "Elton John", 183000, { albumName: "Too Low For Zero" }),
+            ]));
+
+            expect(topTrack(result.result).info.author).toBe("Elton John");
+        });
+
+        it("normalizes 'clam down' to 'calm down' for Rema", () => {
+            const result = optimizeSearchOrder("spsearch:clam down rema", searchResult([
+                createTrack("Clam Bake", "Random Band", 180000),
+                createTrack("Calm Down", "Rema", 219000, { albumName: "Rave & Roses" }),
+            ]));
+
+            expect(topTrack(result.result).info.author).toBe("Rema");
+        });
+    });
 });

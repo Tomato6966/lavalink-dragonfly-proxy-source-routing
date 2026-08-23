@@ -326,4 +326,51 @@ describe("HTTP proxy controls and coalescing", () => {
         expect(handler.getPlaybackNode("/v4/sessions/sess1/players/123456").id).toBe("nodelink_node");
         expect(handler.getPlaybackNode().id).toBe("nodelink_node");
     });
+
+    it("bridges spsearch queries via YTM-Deezer bridge with Spotify source masking", async () => {
+        const config = makeConfig();
+        config.remapping.deezerYtmBridgeEnabled = true;
+        config.remapping.maskSourceToRequested = true;
+        const { handler } = createHandler(config);
+
+        globalThis.fetch = (async (input: RequestInfo | URL) => {
+            const url = new URL(String(input));
+            const id = url.searchParams.get("identifier");
+            if (id === "ytmsearch:lose yourself" || id === "ytmsearch:loose yourself") {
+                return Response.json({
+                    loadType: "search",
+                    data: [
+                        {
+                            encoded: "ytm_playable_encoded_data",
+                            info: { title: "Lose Yourself", author: "Eminem", length: 326000, sourceName: "youtube", isSeekable: true, isStream: false, position: 0, uri: "https://music.youtube.com/watch?v=123" },
+                        },
+                    ],
+                });
+            }
+            if (id === "dzsearch:Eminem - Lose Yourself") {
+                return Response.json({
+                    loadType: "search",
+                    data: [
+                        {
+                            encoded: "deezer_playable_encoded_data",
+                            info: { title: "Lose Yourself", author: "Eminem", length: 326000, sourceName: "deezer", isSeekable: true, isStream: false, position: 0, uri: "https://deezer.com/track/123" },
+                        },
+                    ],
+                });
+            }
+            return Response.json({ loadType: "empty", data: {} });
+        }) as unknown as typeof fetch;
+
+        const res = await handler.handleRequest(request("/v4/loadtracks?identifier=spsearch%3Aloose%20yourself"));
+        expect(res.status).toBe(200);
+        expect(res.headers.get("x-proxy-bridge")).toBe("ytm-deezer");
+
+        const body = await res.json() as any;
+        expect(body.loadType).toBe("search");
+        expect(body.data[0].info.author).toBe("Eminem");
+        expect(body.data[0].info.sourceName).toBe("spotify"); // Masked to requested Spotify
+        expect(body.data[0].pluginInfo?.actualSource).toBe("deezer"); // True Deezer audio
+        expect(body.data[0].pluginInfo?.originalRequestedSource).toBe("spotify");
+        expect(body.data[0].pluginInfo?.isSourceMasked).toBe(true);
+    });
 });

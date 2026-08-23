@@ -833,10 +833,17 @@ export class HttpProxyHandler {
             }
         }
 
-        // Intelligent Search Bridge: on dzsearch: query, route through YTM for popularity-ranked metadata, then resolve Deezer
+        // Intelligent Search Bridge: on dzsearch: or spsearch: queries (when NodeLink not active),
+        // route through YTM for popularity-ranked metadata, then resolve Deezer
+        const lowerRaw = rawIdentifier.toLowerCase();
+        const isDzSearch = lowerRaw.startsWith("dzsearch:");
+        const isSpSearch = lowerRaw.startsWith("spsearch:");
+        const isNodeLinkEnabled = this.config.upstreams.nodelink_node?.enabled === true &&
+            process.env.UPSTREAM_NODELINK_ENABLED === "true";
+
         if (
             this.config.remapping.deezerYtmBridgeEnabled !== false &&
-            rawIdentifier.toLowerCase().startsWith("dzsearch:") &&
+            (isDzSearch || (isSpSearch && !isNodeLinkEnabled)) &&
             !usedLearnedFastPath
         ) {
             const bridgeStart = performance.now();
@@ -873,6 +880,8 @@ export class HttpProxyHandler {
                     console.log(`[${formatTimestamp()}] [Proxy:Bridge] "${rawIdentifier}" resolved via ${bridge.finalTarget} (from ${bridge.bridgedFrom} -> ${bridge.intermediateQuery || 'direct'}) in ${bridgeDuration}ms -> "${summary?.title || ''}" by "${summary?.author || ''}"`);
                 }
 
+                const originalReqSource = isSpSearch ? "spotify" : "deezer";
+
                 const trace: RoutingTrace = {
                     id: traceId,
                     timestamp: Date.now(),
@@ -880,7 +889,7 @@ export class HttpProxyHandler {
                     finalIdentifier: bridge.intermediateQuery || rawIdentifier,
                     category: rawCategory,
                     cacheStatus: "MISS",
-                    appliedRules: ["deezerYtmBridge", ...appliedRules],
+                    appliedRules: [isSpSearch ? "spotifyYtmBridge" : "deezerYtmBridge", ...appliedRules],
                     attempts: [
                         {
                             attempt: 1,
@@ -911,7 +920,7 @@ export class HttpProxyHandler {
                         intermediateResult: bridge.intermediateResultTitle,
                         finalTarget: bridge.finalTarget,
                         isSourceMasked: maskEnabled,
-                        originalSource: "deezer",
+                        originalSource: originalReqSource,
                         actualSource: bridge.finalTarget,
                     },
                     resultSummary: summary,

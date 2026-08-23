@@ -1,5 +1,5 @@
 import type { LavalinkLoadResult, LavalinkTrack } from "../types";
-import { optimizeSearchOrder } from "../transformers/searchReRanker";
+import { optimizeSearchOrder, normalizeMusicHomophones } from "../transformers/searchReRanker";
 
 export interface BridgeContext {
     rawIdentifier: string;
@@ -32,11 +32,12 @@ function buildTargetedQuery(track: LavalinkTrack): string {
     const author = (track.info.author || "")
         .replace(/\s*-\s*Topic$/i, "")
         .replace(/\s*[([]?\s*(?:feat\.?|ft\.?|featuring)\s+[^)\]]+[)\]]?/gi, "")
+        .replace(/\s*,\s*.*$/i, "")
         .trim();
 
     const title = (track.info.title || "")
-        .replace(/\s*[([](?:official|audio|video|music\s*video|lyrics?\s*(?:video)?|hd|hq|4k|single\s*version)[^)\]]*[)\]]/gi, "")
-        .replace(/\s*-\s*Single$/i, "")
+        .replace(/\s*[([](?:official|audio|video|music\s*video|lyrics?\s*(?:video)?|hd|hq|4k|single\s*version|from\s+[^)\]]+|soundtrack)[^)\]]*[)\]]/gi, "")
+        .replace(/\s*-\s*(?:single|from\s+.*|soundtrack.*)$/i, "")
         .trim();
 
     if (author && title) {
@@ -66,17 +67,18 @@ function hasPlayableTracks(res: LavalinkLoadResult | null): boolean {
 /**
  * Intelligent YouTube Music -> Deezer Search Bridge
  * 
- * 1. Queries YouTube Music (`ytmsearch:<query>`) for authoritative, popularity-weighted metadata.
- * 2. Picks and re-ranks the top authentic track (e.g. "The Weather Girls" - "It's Raining Men").
- * 3. Issues a targeted search to Deezer (`dzsearch:The Weather Girls - It's Raining Men`).
+ * 1. Normalizes music homophones and queries YouTube Music (`ytmsearch:<query>`) for authoritative metadata.
+ * 2. Runs middle-stage candidate re-ranking on the YTM pool to select the authentic canonical studio master.
+ * 3. Issues a targeted search to Deezer (`dzsearch:Artist - Title`).
  * 4. If Deezer succeeds -> returns authentic Deezer audio.
- * 5. If Deezer fails/empty -> seamlessly falls back to the YouTube Music audio result!
+ * 5. If Deezer fails/empty -> seamlessly falls back to the top YouTube Music audio candidate!
  */
 export async function resolveYtmToDeezerBridge(
     rawQuery: string,
     executeUpstreamSearch: (identifier: string) => Promise<LavalinkLoadResult | null>
 ): Promise<BridgeResult> {
-    const cleanQuery = cleanQueryTerm(rawQuery);
+    const rawClean = cleanQueryTerm(rawQuery);
+    const cleanQuery = normalizeMusicHomophones(rawClean);
     if (!cleanQuery) {
         return {
             result: null,
@@ -107,7 +109,7 @@ export async function resolveYtmToDeezerBridge(
     }
 
     // Step 2: Re-rank YouTube Music candidates to pick the top authentic artist & title
-    const reRankedYtm = optimizeSearchOrder(ytmIdentifier, ytmResult);
+    const reRankedYtm = optimizeSearchOrder(rawQuery, ytmResult);
     const topYtmTrack = (reRankedYtm.result.loadType === "search"
         ? (reRankedYtm.result.data as LavalinkTrack[])[0]
         : (reRankedYtm.result.data as any)?.tracks?.[0]) as LavalinkTrack | undefined;

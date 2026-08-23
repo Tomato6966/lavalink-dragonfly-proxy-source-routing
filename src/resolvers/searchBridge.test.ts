@@ -111,17 +111,107 @@ describe("Search Bridge Engine (YTM -> Deezer)", () => {
         expect(tracks[0].pluginInfo?.isSourceMasked).toBe(true);
     });
 
-    it("does not alter sourceName when source masking is disabled", () => {
-        const loadResult: LavalinkLoadResult = {
-            loadType: "search",
-            data: [
-                createTrack("It's Raining Men", "The Weather Girls", "youtube"),
-            ],
+    it("re-ranks YTM intermediate pool to pick Elton John over Taron Egerton OST for 'i\\'m still standing'", async () => {
+        const mockUpstream = async (identifier: string): Promise<LavalinkLoadResult | null> => {
+            if (identifier.startsWith("ytmsearch:")) {
+                // YTM raw list has viral Rocketman OST as index 0, Elton John as index 1
+                return {
+                    loadType: "search",
+                    data: [
+                        createTrack("I'm Still Standing (From \"Rocketman\" Soundtrack)", "Taron Egerton", "youtube", { albumName: "Rocketman OST" }),
+                        createTrack("I'm Still Standing", "Elton John", "youtube", { albumName: "Too Low For Zero" }),
+                    ],
+                };
+            }
+            if (identifier.startsWith("dzsearch:Elton John - I'm Still Standing")) {
+                return {
+                    loadType: "search",
+                    data: [
+                        createTrack("I'm Still Standing", "Elton John", "deezer", { albumName: "Too Low For Zero" }),
+                    ],
+                };
+            }
+            return null;
         };
 
-        const unmasked = applySourceMasking(loadResult, "dzsearch:it's raining men", false);
-        const tracks = unmasked.data as LavalinkTrack[];
+        const bridge = await resolveYtmToDeezerBridge("dzsearch:i'm still standing", mockUpstream);
+        expect(bridge.success).toBe(true);
+        expect(bridge.finalTarget).toBe("deezer");
+        expect(bridge.intermediateResultTitle).toBe("Elton John - I'm Still Standing");
+        expect(bridge.intermediateQuery).toBe("dzsearch:Elton John - I'm Still Standing");
 
-        expect(tracks[0].info.sourceName).toBe("youtube");
+        const tracks = bridge.result?.data as LavalinkTrack[];
+        expect(tracks[0].info.author).toBe("Elton John");
+    });
+
+    it("bridges spsearch query with homophone normalization ('loose yourself' -> Eminem)", async () => {
+        let searchedYtmQuery = "";
+        const mockUpstream = async (identifier: string): Promise<LavalinkLoadResult | null> => {
+            if (identifier.startsWith("ytmsearch:")) {
+                searchedYtmQuery = identifier;
+                return {
+                    loadType: "search",
+                    data: [
+                        createTrack("Lose Yourself", "Eminem", "youtube", { albumName: "8 Mile" }),
+                    ],
+                };
+            }
+            if (identifier.startsWith("dzsearch:Eminem - Lose Yourself")) {
+                return {
+                    loadType: "search",
+                    data: [
+                        createTrack("Lose Yourself", "Eminem", "deezer", { albumName: "Curtain Call" }),
+                    ],
+                };
+            }
+            return null;
+        };
+
+        const bridge = await resolveYtmToDeezerBridge("spsearch:loose yourself", mockUpstream);
+        expect(searchedYtmQuery).toBe("ytmsearch:lose yourself");
+        expect(bridge.success).toBe(true);
+        expect(bridge.finalTarget).toBe("deezer");
+
+        // Apply source masking as proxy would
+        const masked = applySourceMasking(bridge.result!, "spsearch:loose yourself", true);
+        const tracks = masked.data as LavalinkTrack[];
+        expect(tracks[0].info.author).toBe("Eminem");
+        expect(tracks[0].info.sourceName).toBe("spotify");
+        expect(tracks[0].pluginInfo?.actualSource).toBe("deezer");
+        expect(tracks[0].pluginInfo?.originalRequestedSource).toBe("spotify");
+        expect(tracks[0].pluginInfo?.isSourceMasked).toBe(true);
+    });
+
+    it("bridges spsearch:no diggity avoiding Deezer brass band trap", async () => {
+        const mockUpstream = async (identifier: string): Promise<LavalinkLoadResult | null> => {
+            if (identifier.startsWith("ytmsearch:")) {
+                return {
+                    loadType: "search",
+                    data: [
+                        createTrack("No Diggity (feat. Dr. Dre, Queen Pen)", "Blackstreet", "youtube", { albumName: "Another Level" }),
+                    ],
+                };
+            }
+            if (identifier.startsWith("dzsearch:Blackstreet - No Diggity")) {
+                return {
+                    loadType: "search",
+                    data: [
+                        createTrack("No Diggity", "Blackstreet", "deezer", { albumName: "Another Level" }),
+                        createTrack("No Diggity", "High & Mighty Brass Band", "deezer"),
+                    ],
+                };
+            }
+            return null;
+        };
+
+        const bridge = await resolveYtmToDeezerBridge("spsearch:no diggity", mockUpstream);
+        expect(bridge.success).toBe(true);
+        expect(bridge.finalTarget).toBe("deezer");
+
+        const masked = applySourceMasking(bridge.result!, "spsearch:no diggity", true);
+        const tracks = masked.data as LavalinkTrack[];
+        expect(tracks[0].info.author).toBe("Blackstreet");
+        expect(tracks[0].info.sourceName).toBe("spotify");
+        expect(tracks[0].pluginInfo?.actualSource).toBe("deezer");
     });
 });
