@@ -373,4 +373,56 @@ describe("HTTP proxy controls and coalescing", () => {
         expect(body.data[0].pluginInfo?.originalRequestedSource).toBe("spotify");
         expect(body.data[0].pluginInfo?.isSourceMasked).toBe(true);
     });
+
+    it("aggregates /v4/stats across all active cluster nodes in parallel", async () => {
+        const config = makeConfig();
+        config.upstreams = {
+            default: {
+                id: "node_1",
+                url: "http://127.0.0.1:2333",
+            },
+            node_2: {
+                id: "node_2",
+                url: "http://127.0.0.1:2334",
+            },
+        };
+        const { handler } = createHandler(config);
+
+        globalThis.fetch = (async (input: RequestInfo | URL) => {
+            const urlStr = String(input);
+            if (urlStr.includes("2333/v4/stats")) {
+                return Response.json({
+                    players: 10,
+                    playingPlayers: 8,
+                    uptime: 5000,
+                    memory: { free: 1000, used: 2000, allocated: 3000, reservable: 4000 },
+                    cpu: { cores: 4, lavalinkLoad: 0.1, systemLoad: 0.2 },
+                });
+            }
+            if (urlStr.includes("2334/v4/stats")) {
+                return Response.json({
+                    players: 15,
+                    playingPlayers: 12,
+                    uptime: 7000,
+                    memory: { free: 2000, used: 3000, allocated: 5000, reservable: 6000 },
+                    cpu: { cores: 8, lavalinkLoad: 0.2, systemLoad: 0.3 },
+                });
+            }
+            return Response.json({ status: 404 }, { status: 404 });
+        }) as unknown as typeof fetch;
+
+        const res = await handler.handleRequest(request("/v4/stats"));
+        expect(res.status).toBe(200);
+        expect(res.headers.get("x-proxy-cluster-nodes")).toBe("2");
+
+        const stats = await res.json() as any;
+        expect(stats.players).toBe(25);
+        expect(stats.playingPlayers).toBe(20);
+        expect(stats.uptime).toBe(7000);
+        expect(stats.memory.used).toBe(5000);
+        expect(stats.memory.allocated).toBe(8000);
+        expect(stats.cpu.cores).toBe(8);
+        expect(stats.cpu.lavalinkLoad).toBe(0.15); // Average of 0.1 and 0.2
+        expect(stats.cpu.systemLoad).toBe(0.25);   // Average of 0.2 and 0.3
+    });
 });

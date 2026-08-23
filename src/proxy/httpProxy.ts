@@ -1,6 +1,6 @@
 import type { LavalinkProxyConfig, UpstreamNodeConfig, LavalinkLoadResult, LavalinkTrack, RoutingTrace, CascadeAttemptTrace, RuntimeConfigUpdateRequest } from "../types";
 import type { DragonflyCacheManager } from "../cache";
-import { classifyIdentifier, type FallbackFailureContext, type UpstreamRouter } from "../routing";
+import { classifyIdentifier, type FallbackFailureContext, type UpstreamRouter, UpstreamNodePool } from "../routing";
 import type { EventHubManager } from "../eventHub";
 import { buildEmptyResult, buildErrorResult } from "../builders";
 import { isLavalinkLoadResult, isPlayableLoadResult } from "../validation/lavalink";
@@ -38,8 +38,10 @@ export class HttpProxyHandler {
     private readonly cache: DragonflyCacheManager;
     private readonly router: UpstreamRouter;
     private readonly eventHub: EventHubManager;
+    public readonly nodePool: UpstreamNodePool;
     private readonly startTime = Date.now();
     private readonly inFlightLoads = new Map<string, Promise<ProxyResult>>();
+    private readonly inFlightDirectPlaybacks = new Map<string, Promise<{ result: LavalinkLoadResult | null; cacheStatus: "HIT" | "MISS"; httpStatus: number }>>();
     private readonly circuits = new Map<string, CircuitState>();
     private readonly traces: RoutingTrace[] = [];
     private readonly runtimeStats: RuntimeStats = {
@@ -54,55 +56,34 @@ export class HttpProxyHandler {
         config: LavalinkProxyConfig,
         cache: DragonflyCacheManager,
         router: UpstreamRouter,
-        eventHub: EventHubManager
+        eventHub: EventHubManager,
+        nodePool?: UpstreamNodePool
     ) {
         this.config = config;
         this.cache = cache;
         this.router = router;
         this.eventHub = eventHub;
+        this.nodePool = nodePool || router.nodePool || new UpstreamNodePool(config);
     }
 
     public onConfigUpdated?: (newConfig: LavalinkProxyConfig) => void;
 
     public updateConfig(newConfig: LavalinkProxyConfig): void {
         this.config = newConfig;
+        this.nodePool.updateConfig(newConfig);
     }
 
     /**
      * Resolve the target upstream node for player sessions, voice audio, or playback
-     * based on primaryPlaybackNode and dynamic playerRouting rules.
+     * based on primaryPlaybackNode, dynamic playerRouting rules, and Consistent Hashing.
      */
     public getPlaybackNode(pathname?: string, guildId?: string): UpstreamNodeConfig {
-        if (this.config.server.playerRouting && Array.isArray(this.config.server.playerRouting)) {
-            let gId = guildId;
-            if (!gId && pathname) {
-                const match = pathname.match(/\/players\/([^/?#]+)/);
-                if (match) gId = match[1];
-            }
-            if (gId) {
-                for (const rule of this.config.server.playerRouting) {
-                    if (rule.guildId && rule.guildId === gId) {
-                        const target = this.config.upstreams[rule.routeToNode];
-                        if (target && target.enabled !== false) return target;
-                    }
-                    if (rule.guildIdMatch) {
-                        try {
-                            if (new RegExp(rule.guildIdMatch, "i").test(gId)) {
-                                const target = this.config.upstreams[rule.routeToNode];
-                                if (target && target.enabled !== false) return target;
-                            }
-                        } catch {}
-                    }
-                }
-            }
+        let gId = guildId;
+        if (!gId && pathname) {
+            const match = pathname.match(/\/players\/([^/?#]+)/);
+            if (match) gId = match[1];
         }
-
-        const primaryName = this.config.server.primaryPlaybackNode;
-        if (primaryName && this.config.upstreams[primaryName] && this.config.upstreams[primaryName].enabled !== false) {
-            return this.config.upstreams[primaryName];
-        }
-
-        return this.config.upstreams.default;
+        return this.nodePool.getNodeForPlayback(gId);
     }
 
     private recordTrace(trace: RoutingTrace): void {
@@ -241,6 +222,10 @@ export class HttpProxyHandler {
             return this.handleDecodeTracks(req, url);
         }
 
+        if (pathname === "/v4/stats" && req.method === "GET") {
+            return this.handleClusterStats(req, url);
+        }
+
         const isPlayerUpdate = req.method === "PATCH" && /^\/v4\/sessions\/[^/]+\/players\/[^/]+$/.test(pathname);
         if (isPlayerUpdate) {
             const response = await this.handlePlayerUpdate(req, url, requestStartedAt);
@@ -251,7 +236,7 @@ export class HttpProxyHandler {
             return response;
         }
 
-        const targetNode = pathname.startsWith("/v4/sessions") ? this.getPlaybackNode(pathname) : this.config.upstreams.default;
+        const targetNode = pathname.startsWith("/v4/sessions") ? this.getPlaybackNode(pathname) : this.nodePool.getDefaultNode();
         const response = await this.forwardGenericRequest(req, targetNode, url);
         if (this.config.logging.logRoutes) {
             const took = (performance.now() - requestStartedAt).toFixed(2);
@@ -489,6 +474,109 @@ export class HttpProxyHandler {
         });
     }
 
+    private async handleClusterStats(req: Request, url: URL): Promise<Response> {
+        const nodes = this.nodePool.getHealthyNodes(n => n.enabled !== false);
+        if (nodes.length <= 1) {
+            return this.forwardGenericRequest(req, this.nodePool.getDefaultNode(), url);
+        }
+
+        const timeoutMs = this.config.server.upstreamRequestTimeoutMs ?? 3500;
+        const statPromises = nodes.map(async (node) => {
+            try {
+                const targetUrl = this.createUpstreamUrl(node, "/v4/stats");
+                const res = await fetch(targetUrl, {
+                    headers: {
+                        Authorization: node.password || this.config.server.password,
+                        Accept: "application/json",
+                    },
+                    signal: AbortSignal.timeout(timeoutMs),
+                });
+                if (res.ok) {
+                    return (await res.json()) as any;
+                }
+            } catch {}
+            return null;
+        });
+
+        const settled = await Promise.all(statPromises);
+        const stats = settled.filter(Boolean);
+
+        if (stats.length === 0) {
+            return this.forwardGenericRequest(req, this.nodePool.getDefaultNode(), url);
+        }
+
+        let totalPlayers = 0;
+        let totalPlaying = 0;
+        let maxUptime = 0;
+        let memAllocated = 0;
+        let memUsed = 0;
+        let memFree = 0;
+        let memReservable = 0;
+        let totalCores = 0;
+        let sumLavalinkLoad = 0;
+        let sumSystemLoad = 0;
+        let framesSent = 0;
+        let framesNulled = 0;
+        let framesDeficit = 0;
+        let hasFrames = false;
+
+        for (const s of stats) {
+            totalPlayers += s.players || 0;
+            totalPlaying += s.playingPlayers || 0;
+            maxUptime = Math.max(maxUptime, s.uptime || 0);
+
+            if (s.memory) {
+                memAllocated += s.memory.allocated || 0;
+                memUsed += s.memory.used || 0;
+                memFree += s.memory.free || 0;
+                memReservable += s.memory.reservable || 0;
+            }
+
+            if (s.cpu) {
+                totalCores = Math.max(totalCores, s.cpu.cores || 0);
+                sumLavalinkLoad += s.cpu.lavalinkLoad || 0;
+                sumSystemLoad += s.cpu.systemLoad || 0;
+            }
+
+            if (s.frameStats) {
+                hasFrames = true;
+                framesSent += s.frameStats.sent || 0;
+                framesNulled += s.frameStats.nulled || 0;
+                framesDeficit += s.frameStats.deficit || 0;
+            }
+        }
+
+        const count = stats.length;
+        const aggregated: Record<string, any> = {
+            players: totalPlayers,
+            playingPlayers: totalPlaying,
+            uptime: maxUptime,
+            memory: {
+                free: memFree,
+                used: memUsed,
+                allocated: memAllocated,
+                reservable: memReservable,
+            },
+            cpu: {
+                cores: totalCores,
+                lavalinkLoad: count > 0 ? Number((sumLavalinkLoad / count).toFixed(4)) : 0,
+                systemLoad: count > 0 ? Number((sumSystemLoad / count).toFixed(4)) : 0,
+            },
+        };
+
+        if (hasFrames) {
+            aggregated.frameStats = {
+                sent: framesSent,
+                nulled: framesNulled,
+                deficit: framesDeficit,
+            };
+        }
+
+        return Response.json(aggregated, {
+            headers: { "X-Proxy-Cluster-Nodes": String(count) },
+        });
+    }
+
     private async handleDecodeTrack(req: Request, url: URL): Promise<Response> {
         const encodedTrack = url.searchParams.get("encodedTrack")?.trim();
         if (encodedTrack) {
@@ -499,7 +587,8 @@ export class HttpProxyHandler {
                 });
             }
         }
-        const response = await this.forwardGenericRequest(req, this.config.upstreams.default, url);
+        const decodeNode = this.nodePool.getNodeForDecode();
+        const response = await this.forwardGenericRequest(req, decodeNode, url);
         if (response.ok && encodedTrack) {
             try {
                 const cloned = response.clone();
@@ -544,10 +633,11 @@ export class HttpProxyHandler {
             return Response.json(results, { headers: { "X-Proxy-Cache": "HIT" } });
         }
 
+        const decodeNode = this.nodePool.getNodeForDecode();
         try {
-            const upstreamTarget = this.createUpstreamUrl(this.config.upstreams.default, "/v4/decodetracks");
+            const upstreamTarget = this.createUpstreamUrl(decodeNode, "/v4/decodetracks");
             const headers = new Headers(req.headers);
-            headers.set("authorization", this.config.upstreams.default.password || this.config.server.password);
+            headers.set("authorization", decodeNode.password || this.config.server.password);
             headers.set("content-type", "application/json");
 
             const response = await fetch(upstreamTarget, {
@@ -577,7 +667,7 @@ export class HttpProxyHandler {
             console.error(`[${formatTimestamp()}] [Proxy:DecodeTracks:ERR] ${error instanceof Error ? error.message : error}`);
         }
 
-        return this.forwardGenericRequest(req, this.config.upstreams.default, url);
+        return this.forwardGenericRequest(req, decodeNode, url);
     }
 
     private extractPlayableTrack(loadResult: LavalinkLoadResult): LavalinkTrack | null {
@@ -602,18 +692,31 @@ export class HttpProxyHandler {
         rawIdentifier: string,
         requestStartedAt: number
     ): Promise<{ result: LavalinkLoadResult | null; cacheStatus: "HIT" | "MISS"; httpStatus: number }> {
-        const dummyUrl = new URL(`http://proxy/v4/loadtracks?identifier=${encodeURIComponent(rawIdentifier)}`);
-        const dummyReq = new Request(dummyUrl, {
-            headers: { authorization: this.config.server.password || "" },
-        });
-        const loadResult = await this.handleCoalescedLoad(dummyReq, dummyUrl, requestStartedAt);
-        const data = loadResult.data as LavalinkLoadResult;
-        const cacheHit = loadResult.headers?.["X-Proxy-Cache"] === "HIT";
-        return {
-            result: isLavalinkLoadResult(data) ? data : null,
-            cacheStatus: cacheHit ? "HIT" : "MISS",
-            httpStatus: loadResult.status,
-        };
+        const cacheKey = `direct:${rawIdentifier}`;
+        if (this.inFlightDirectPlaybacks.has(cacheKey)) return this.inFlightDirectPlaybacks.get(cacheKey)!;
+
+        const promise = (async () => {
+            const dummyUrl = new URL(`http://proxy/v4/loadtracks?identifier=${encodeURIComponent(rawIdentifier)}`);
+            const dummyReq = new Request(dummyUrl, {
+                headers: { authorization: this.config.server.password || "" },
+            });
+            const loadResult = await this.handleCoalescedLoad(dummyReq, dummyUrl, requestStartedAt);
+            const data = loadResult.data as LavalinkLoadResult;
+            const cacheHit = loadResult.headers?.["X-Proxy-Cache"] === "HIT";
+            const cacheStatus: "HIT" | "MISS" = cacheHit ? "HIT" : "MISS";
+            return {
+                result: isLavalinkLoadResult(data) ? data : null,
+                cacheStatus,
+                httpStatus: loadResult.status,
+            };
+        })();
+
+        this.inFlightDirectPlaybacks.set(cacheKey, promise);
+        try {
+            return await promise;
+        } finally {
+            this.inFlightDirectPlaybacks.delete(cacheKey);
+        }
     }
 
     private async handlePlayerUpdate(req: Request, url: URL, requestStartedAt: number): Promise<Response> {
@@ -625,7 +728,7 @@ export class HttpProxyHandler {
         }
 
         if (!bodyText || bodyText.trim() === "") {
-            return this.forwardWithBody(req, this.config.upstreams.default, url, bodyText);
+            return this.forwardWithBody(req, this.nodePool.getDefaultNode(), url, bodyText);
         }
 
         let body: Record<string, any>;
@@ -675,7 +778,7 @@ export class HttpProxyHandler {
         }
 
         const serialized = JSON.stringify(body);
-        const upstreamResponse = await this.forwardWithBody(req, this.config.upstreams.default, url, serialized);
+        const upstreamResponse = await this.forwardWithBody(req, this.getPlaybackNode(url.pathname), url, serialized);
 
         if (resolvedTrackEncoded) {
             const headers = new Headers(upstreamResponse.headers);
@@ -732,7 +835,7 @@ export class HttpProxyHandler {
 
         const traceId = `tr_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
         const cascadeAttempts: CascadeAttemptTrace[] = [];
-        const playbackEncodingScope = this.encodingScope(this.config.upstreams.default);
+        const playbackEncodingScope = this.encodingScope(this.nodePool.getDefaultNode());
         const rawCategory = classifyIdentifier(rawIdentifier);
 
         const initialCached = await this.cache.get(rawCategory, rawIdentifier, playbackEncodingScope) as LavalinkLoadResult | null;
@@ -763,37 +866,31 @@ export class HttpProxyHandler {
             };
         }
 
-        if (this.config.logging.logMisses) {
-            console.log(`[${formatTimestamp()}] [Proxy:Cache:MISS] ${rawCategory} "${rawIdentifier}"`);
-        }
-
+        let remappedCached: LavalinkLoadResult | null = null;
         const preResult = await this.router.applyPreRequest(rawIdentifier);
         let currentIdentifier = preResult.transformedIdentifier;
         let targetNode = preResult.targetNode;
+        let appliedRules: string[] = preResult.appliedRules.map((r) => r.name || "unnamed");
         let isEventHub = false;
         let isInProcess = false;
         let handlerName: string | undefined;
         let attemptTimeoutMs: number | undefined;
-        let attemptEncodingScope = this.encodingScope(targetNode);
-        const appliedRules = preResult.appliedRules.map((r) => r.name || "rule");
+        let attemptEncodingScope: string | undefined = this.encodingScope(targetNode);
 
-        if (preResult.isRemapped && this.config.logging.logRoutes) {
-            console.log(`[${formatTimestamp()}] [Proxy:Remap] "${rawIdentifier}" -> "${currentIdentifier}" (rules: ${appliedRules.join(", ")})`);
-        }
-
-        if (preResult.isRemapped) {
-            const remappedCached = await this.cache.get(preResult.cacheCategory, currentIdentifier, playbackEncodingScope) as LavalinkLoadResult | null;
+        if (preResult.isRemapped && currentIdentifier !== rawIdentifier) {
+            remappedCached = await this.cache.get(preResult.cacheCategory, currentIdentifier, attemptEncodingScope) as LavalinkLoadResult | null;
             if (remappedCached && this.isValidLoadResult(remappedCached)) {
                 const took = (performance.now() - requestStartedAt).toFixed(2);
                 if (this.config.logging.logHits) {
-                    console.log(`[${formatTimestamp()}] [Proxy:Cache:HIT] ${preResult.cacheCategory} "${currentIdentifier}" (remapped from "${rawIdentifier}") (${took}ms)`);
+                    console.log(`[${formatTimestamp()}] [Proxy:Cache:HIT:Remapped] ${preResult.cacheCategory} "${currentIdentifier}" (for "${rawIdentifier}") (${took}ms)`);
                 }
+                await this.cache.set(rawCategory, rawIdentifier, remappedCached, undefined, playbackEncodingScope);
                 this.recordTrace({
                     id: traceId,
                     timestamp: Date.now(),
                     rawIdentifier,
                     finalIdentifier: currentIdentifier,
-                    category: preResult.cacheCategory,
+                    category: rawCategory,
                     cacheStatus: "HIT",
                     appliedRules,
                     attempts: [],
@@ -811,15 +908,19 @@ export class HttpProxyHandler {
             }
         }
 
+        if (this.config.logging.logMisses) {
+            console.log(`[${formatTimestamp()}] [Proxy:Cache:MISS] ${rawCategory} "${rawIdentifier}"`);
+        }
+
         let usedLearnedFastPath = false;
         if (this.config.remapping.routeLearning !== false) {
             const learned = await this.cache.getLearnedRoute(rawIdentifier, playbackEncodingScope);
-            const learnedNode = learned ? this.config.upstreams[learned.targetNodeName] : undefined;
+            const learnedNode = learned ? this.nodePool.getNodeByName(learned.targetNodeName) : undefined;
             const learnedEncodingScope = learned?.encodingScope || (learnedNode ? this.encodingScope(learnedNode) : undefined);
             if (learned && learnedEncodingScope === playbackEncodingScope &&
                 ((learnedNode && learnedNode.enabled !== false) || learned.isEventHub || learned.isInProcess)) {
                 currentIdentifier = learned.transformedIdentifier;
-                targetNode = this.config.upstreams[learned.targetNodeName] ?? targetNode;
+                targetNode = learnedNode ?? targetNode;
                 isEventHub = learned.isEventHub;
                 isInProcess = learned.isInProcess;
                 handlerName = learned.handlerName;
@@ -838,7 +939,7 @@ export class HttpProxyHandler {
         const lowerRaw = rawIdentifier.toLowerCase();
         const isDzSearch = lowerRaw.startsWith("dzsearch:");
         const isSpSearch = lowerRaw.startsWith("spsearch:");
-        const isNodeLinkEnabled = this.config.upstreams.nodelink_node?.enabled === true &&
+        const isNodeLinkEnabled = (this.nodePool.hasCapability("nodelink") || Boolean(this.config.upstreams.nodelink_node?.enabled)) &&
             process.env.UPSTREAM_NODELINK_ENABLED === "true";
 
         if (
@@ -847,8 +948,9 @@ export class HttpProxyHandler {
             !usedLearnedFastPath
         ) {
             const bridgeStart = performance.now();
+            const bridgeTarget = this.nodePool.getDefaultNode();
             const bridge = await resolveYtmToDeezerBridge(rawIdentifier, async (id) => {
-                const up = await this.loadFromUpstream(req, url, this.config.upstreams.default, id);
+                const up = await this.loadFromUpstream(req, url, bridgeTarget, id);
                 return up.data;
             });
 

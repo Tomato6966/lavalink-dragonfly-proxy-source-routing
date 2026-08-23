@@ -18,12 +18,14 @@ async function main(): Promise<void> {
     const config = await loadConfig();
     const cacheManager = new DragonflyCacheManager(config.dragonfly);
     const router = new UpstreamRouter(config);
+    const nodePool = router.nodePool;
     const eventHub = new EventHubManager(config.eventHub);
-    const httpHandler = new HttpProxyHandler(config, cacheManager, router, eventHub);
-    const wsProxy = new WebSocketProxyHandler(config);
+    const httpHandler = new HttpProxyHandler(config, cacheManager, router, eventHub, nodePool);
+    const wsProxy = new WebSocketProxyHandler(config, nodePool);
     httpHandler.onConfigUpdated = (newConfig) => {
         wsProxy.updateConfig(newConfig);
     };
+    nodePool.startHealthProber();
     const pendingUpgradeHeaders = new Map<string, Record<string, string>>();
 
     const server = Bun.serve<WsClientData>({
@@ -115,6 +117,7 @@ async function main(): Promise<void> {
         if (shuttingDown) return;
         shuttingDown = true;
         console.log("[Proxy] Shutting down gracefully");
+        nodePool.stopHealthProber();
         eventHub.close();
         server.stop(true);
         await cacheManager.close();

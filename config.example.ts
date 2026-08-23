@@ -161,6 +161,32 @@ export const config: LavalinkProxyConfig = {
     },
 
     /**
+     * 🌐 [DYNAMIC CLUSTER & LOAD BALANCING]
+     * 
+     * Manages scaling from 1 node to 100+ upstream Lavalink/NodeLink nodes dynamically.
+     */
+    cluster: {
+        // Master switch for dynamic clustering and health probing (default: true)
+        enabled: process.env.CLUSTER_ENABLED !== "false",
+
+        // Load balancing strategy for player sessions:
+        // - "consistent-hash"  -> Automatic uniform distribution across all healthy nodes by Guild ID
+        // - "least-connections"-> Routes to the node with the fewest active requests
+        // - "round-robin"      -> Dispatches requests sequentially across all healthy nodes
+        // - "priority"         -> Routes based on node priority fields
+        strategy: (process.env.CLUSTER_STRATEGY as any) || "consistent-hash",
+
+        // Background health probe interval in milliseconds (default: 15,000ms = 15s)
+        healthCheckIntervalMs: Number(process.env.CLUSTER_HEALTH_INTERVAL_MS || 15000),
+
+        // Timeout for health check probes to GET /version or /v4/info (default: 2,500ms)
+        healthCheckTimeoutMs: Number(process.env.CLUSTER_HEALTH_TIMEOUT_MS || 2500),
+
+        // Automatically rebalance consistent hash ring when a node fails or recovers (default: true)
+        autoRebalance: process.env.CLUSTER_AUTO_REBALANCE !== "false",
+    },
+
+    /**
      * [DRAGONFLY / REDIS CACHE] Multi-Tiered L1 Memory & Remote Cache
      */
     dragonfly: {

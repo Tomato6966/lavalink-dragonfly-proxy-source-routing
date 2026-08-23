@@ -36,6 +36,8 @@ export interface WsClientData {
     name?: string;
     handlers?: Set<string>;
     upstreamWs?: WebSocket;
+    upstreamSockets?: Map<string, WebSocket>;
+    upstreamConnectTimers?: Map<string, ReturnType<typeof setTimeout>>;
     messageQueue?: (string | ArrayBuffer | Uint8Array)[];
     messageQueueBytes?: number;
     upstreamConnectTimer?: ReturnType<typeof setTimeout>;

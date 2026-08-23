@@ -1,6 +1,4 @@
-/**
- * Proxy and Subsystem Configuration Types
- */
+export type LoadBalancerStrategy = "consistent-hash" | "least-connections" | "round-robin" | "priority";
 
 export interface UpstreamNodeConfig {
     id: string;
@@ -9,6 +7,12 @@ export interface UpstreamNodeConfig {
     password?: string;
     priority?: number;
     enabled?: boolean;
+    /** Node type / engine descriptor (e.g. "lavalink", "nodelink") */
+    type?: "lavalink" | "nodelink" | "custom" | string;
+    /** Capabilities / functional tags (e.g. ["search", "playback", "lyrics", "deezer"]) */
+    tags?: string[];
+    /** Relative weight for weighted load balancing strategies (default: 1) */
+    weight?: number;
     /** Nodes may exchange encoded tracks only when this matches the default playback node. */
     encodingScope?: string;
     /** Total deadline for an upstream REST request. */
@@ -17,6 +21,14 @@ export interface UpstreamNodeConfig {
     failureThreshold?: number;
     /** How long an open circuit waits before allowing another probe. */
     circuitBreakerResetMs?: number;
+}
+
+export interface ClusterConfig {
+    enabled?: boolean;
+    strategy?: LoadBalancerStrategy;
+    healthCheckIntervalMs?: number;
+    healthCheckTimeoutMs?: number;
+    autoRebalance?: boolean;
 }
 
 export interface PreRequestRule {
@@ -123,6 +135,7 @@ export interface ProxyServerConfig {
 export interface RuntimeConfigUpdateRequest {
     mode?: "temporary" | "permanent";
     server?: Partial<ProxyServerConfig>;
+    cluster?: Partial<ClusterConfig>;
     dragonfly?: Partial<DragonflyCacheConfig>;
     remapping?: Partial<RemappingConfig>;
     upstreams?: Record<string, Partial<UpstreamNodeConfig>>;
@@ -176,6 +189,7 @@ export interface RoutingTrace {
 
 export interface LavalinkProxyConfig {
     server: ProxyServerConfig;
+    cluster?: ClusterConfig;
     dragonfly: DragonflyCacheConfig;
     eventHub: EventHubConfig;
     remapping: RemappingConfig;

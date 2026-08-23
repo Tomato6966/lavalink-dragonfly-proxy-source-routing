@@ -1,6 +1,9 @@
 import type { LavalinkProxyConfig, UpstreamNodeConfig, PreRequestRule, PostRequestOnFailRule } from "../types";
 import { TransformerRegistry, extractYouTubeVideoId, fetchYouTubeOEmbedTitle } from "../transformers";
 import { MetadataResolverRegistry } from "../resolvers";
+import { UpstreamNodePool } from "./nodePool";
+
+export * from "./nodePool";
 
 export type CacheCategory = "search" | "track" | "lyrics" | "other";
 
@@ -60,21 +63,24 @@ export class UpstreamRouter {
     private config: LavalinkProxyConfig;
     public readonly transformers: TransformerRegistry;
     public readonly resolvers: MetadataResolverRegistry;
+    public readonly nodePool: UpstreamNodePool;
 
-    constructor(config: LavalinkProxyConfig) {
+    constructor(config: LavalinkProxyConfig, nodePool?: UpstreamNodePool) {
         this.config = config;
         this.transformers = new TransformerRegistry();
         this.resolvers = new MetadataResolverRegistry();
+        this.nodePool = nodePool || new UpstreamNodePool(config);
     }
 
     public updateConfig(newConfig: LavalinkProxyConfig): void {
         this.config = newConfig;
+        this.nodePool.updateConfig(newConfig);
     }
 
     private getNode(nodeName: string): UpstreamNodeConfig {
-        const selected = this.config.upstreams[nodeName];
-        if (selected?.enabled !== false) return selected;
-        return this.config.upstreams.default;
+        const selected = this.nodePool.getNodeByName(nodeName);
+        if (selected && selected.enabled !== false) return selected;
+        return this.nodePool.getDefaultNode();
     }
 
     /** Apply every matching rule in order so cleaning, rewriting, and node routing compose. */
