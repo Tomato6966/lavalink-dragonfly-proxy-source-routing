@@ -26,19 +26,44 @@ function cleanQueryTerm(query: string): string {
 }
 
 /**
- * Clean artist and title for targeted downstream resolution
+ * Clean artist and title for targeted downstream resolution.
+ * Automatically avoids duplicate artist prefixes (e.g. "Adele - Adele - Rolling in the Deep")
+ * and extracts clean metadata from YouTube title formats.
  */
-function buildTargetedQuery(track: LavalinkTrack): string {
-    const author = (track.info.author || "")
+export function buildTargetedQuery(track: LavalinkTrack): string {
+    let author = (track.info.author || "")
         .replace(/\s*-\s*Topic$/i, "")
+        .replace(/VEVO$/i, "")
         .replace(/\s*[([]?\s*(?:feat\.?|ft\.?|featuring)\s+[^)\]]+[)\]]?/gi, "")
         .replace(/\s*,\s*.*$/i, "")
         .trim();
 
-    const title = (track.info.title || "")
+    let title = (track.info.title || "")
         .replace(/\s*[([](?:official|audio|video|music\s*video|lyrics?\s*(?:video)?|hd|hq|4k|single\s*version|from\s+[^)\]]+|soundtrack)[^)\]]*[)\]]/gi, "")
         .replace(/\s*-\s*(?:single|from\s+.*|soundtrack.*)$/i, "")
+        .replace(/\s*[([]?\s*(?:feat\.?|ft\.?|featuring)\s+.*$/gi, "")
         .trim();
+
+    // If title contains "Artist - Title", extract the true artist and title
+    const hyphenMatch = title.match(/^(.+?)\s+[-–—:]\s+(.+)$/);
+    if (hyphenMatch) {
+        const potentialArtist = hyphenMatch[1].trim();
+        const potentialTitle = hyphenMatch[2].trim();
+        if (potentialArtist && potentialTitle) {
+            if (
+                !author ||
+                author.toLowerCase() === potentialArtist.toLowerCase() ||
+                author.toLowerCase().includes("vevo") ||
+                author.toLowerCase().includes("topic") ||
+                author.toLowerCase().includes("youtube")
+            ) {
+                author = potentialArtist;
+                title = potentialTitle;
+            } else if (title.toLowerCase().startsWith(author.toLowerCase())) {
+                title = potentialTitle;
+            }
+        }
+    }
 
     if (author && title) {
         return `${author} - ${title}`;
@@ -65,13 +90,13 @@ function hasPlayableTracks(res: LavalinkLoadResult | null): boolean {
 }
 
 /**
- * Intelligent YouTube Music -> Deezer Search Bridge
+ * Intelligent YouTube Search -> Deezer Search Bridge
  * 
- * 1. Normalizes music homophones and queries YouTube Music (`ytmsearch:<query>`) for authoritative metadata.
- * 2. Runs middle-stage candidate re-ranking on the YTM pool to select the authentic canonical studio master.
+ * 1. Normalizes music homophones and queries YouTube (`ytsearch:<query>`) for viewcount-ranked authentic metadata.
+ * 2. Runs middle-stage candidate re-ranking on the YouTube pool to select the canonical master.
  * 3. Issues a targeted search to Deezer (`dzsearch:Artist - Title`).
  * 4. If Deezer succeeds -> returns authentic Deezer audio.
- * 5. If Deezer fails/empty -> seamlessly falls back to the top YouTube Music audio candidate!
+ * 5. If Deezer fails/empty -> seamlessly falls back to the top YouTube audio candidate!
  */
 export async function resolveYtmToDeezerBridge(
     rawQuery: string,
@@ -89,43 +114,42 @@ export async function resolveYtmToDeezerBridge(
         };
     }
 
-    const ytmIdentifier = `ytmsearch:${cleanQuery}`;
-
-    // Step 1: Query YouTube Music
-    let ytmResult = await executeUpstreamSearch(ytmIdentifier);
-    if (!hasPlayableTracks(ytmResult)) {
-        // Fallback to standard ytsearch if ytmsearch is empty
-        ytmResult = await executeUpstreamSearch(`ytsearch:${cleanQuery}`);
+    // Step 1: Query YouTube (ytsearch has global popularity/viewcount prior, fallback to ytmsearch)
+    let ytIdentifier = `ytsearch:${cleanQuery}`;
+    let ytResult = await executeUpstreamSearch(ytIdentifier);
+    if (!hasPlayableTracks(ytResult)) {
+        ytIdentifier = `ytmsearch:${cleanQuery}`;
+        ytResult = await executeUpstreamSearch(ytIdentifier);
     }
 
-    if (!hasPlayableTracks(ytmResult) || !ytmResult) {
+    if (!hasPlayableTracks(ytResult) || !ytResult) {
         return {
             result: null,
-            bridgedFrom: ytmIdentifier,
+            bridgedFrom: ytIdentifier,
             intermediateQuery: "",
             finalTarget: "none",
             success: false,
         };
     }
 
-    // Step 2: Re-rank YouTube Music candidates to pick the top authentic artist & title
-    const reRankedYtm = optimizeSearchOrder(rawQuery, ytmResult);
-    const topYtmTrack = (reRankedYtm.result.loadType === "search"
-        ? (reRankedYtm.result.data as LavalinkTrack[])[0]
-        : (reRankedYtm.result.data as any)?.tracks?.[0]) as LavalinkTrack | undefined;
+    // Step 2: Re-rank YouTube candidates to pick the top authentic artist & title
+    const reRankedYt = optimizeSearchOrder(rawQuery, ytResult);
+    const topYtTrack = (reRankedYt.result.loadType === "search"
+        ? (reRankedYt.result.data as LavalinkTrack[])[0]
+        : (reRankedYt.result.data as any)?.tracks?.[0]) as LavalinkTrack | undefined;
 
-    if (!topYtmTrack) {
+    if (!topYtTrack) {
         return {
-            result: reRankedYtm.result,
-            bridgedFrom: ytmIdentifier,
+            result: reRankedYt.result,
+            bridgedFrom: ytIdentifier,
             intermediateQuery: "",
             finalTarget: "youtube",
             success: true,
         };
     }
 
-    // Step 3: Build targeted query for Deezer
-    const targetedQuery = buildTargetedQuery(topYtmTrack);
+    // Step 3: Build clean targeted query for Deezer (e.g. "Adele - Rolling in the Deep", "David Guetta - Hey Mama")
+    const targetedQuery = buildTargetedQuery(topYtTrack);
     const dzIdentifier = `dzsearch:${targetedQuery}`;
 
     // Step 4: Resolve on Deezer
@@ -141,44 +165,44 @@ export async function resolveYtmToDeezerBridge(
         tracks.forEach((track) => {
             track.pluginInfo = {
                 ...track.pluginInfo,
-                bridgedFrom: ytmIdentifier,
+                bridgedFrom: ytIdentifier,
                 bridgedQuery: targetedQuery,
-                bridgedIntermediate: `${topYtmTrack.info.author} - ${topYtmTrack.info.title}`,
+                bridgedIntermediate: `${topYtTrack.info.author} - ${topYtTrack.info.title}`,
                 actualSource: track.info.sourceName || "deezer",
             };
         });
 
         return {
             result: reRankedDz.result,
-            bridgedFrom: ytmIdentifier,
+            bridgedFrom: ytIdentifier,
             intermediateQuery: dzIdentifier,
-            intermediateResultTitle: `${topYtmTrack.info.author} - ${topYtmTrack.info.title}`,
+            intermediateResultTitle: `${topYtTrack.info.author} - ${topYtTrack.info.title}`,
             finalTarget: "deezer",
             success: true,
         };
     }
 
-    // Step 6: Deezer resolution failed or was empty -> fallback to YouTube Music audio
-    const ytmTracks = reRankedYtm.result.loadType === "search"
-        ? (reRankedYtm.result.data as LavalinkTrack[])
-        : ((reRankedYtm.result.data as any)?.tracks as LavalinkTrack[] || []);
+    // Step 6: Deezer resolution failed or was empty -> fallback to YouTube audio
+    const ytTracks = reRankedYt.result.loadType === "search"
+        ? (reRankedYt.result.data as LavalinkTrack[])
+        : ((reRankedYt.result.data as any)?.tracks as LavalinkTrack[] || []);
 
-    ytmTracks.forEach((track) => {
+    ytTracks.forEach((track) => {
         track.pluginInfo = {
             ...track.pluginInfo,
-            bridgedFrom: ytmIdentifier,
+            bridgedFrom: ytIdentifier,
             bridgedQuery: targetedQuery,
-            bridgedIntermediate: `${topYtmTrack.info.author} - ${topYtmTrack.info.title}`,
+            bridgedIntermediate: `${topYtTrack.info.author} - ${topYtTrack.info.title}`,
             actualSource: track.info.sourceName || "youtube",
             bridgeFallback: true,
         };
     });
 
     return {
-        result: reRankedYtm.result,
-        bridgedFrom: ytmIdentifier,
+        result: reRankedYt.result,
+        bridgedFrom: ytIdentifier,
         intermediateQuery: dzIdentifier,
-        intermediateResultTitle: `${topYtmTrack.info.author} - ${topYtmTrack.info.title}`,
+        intermediateResultTitle: `${topYtTrack.info.author} - ${topYtTrack.info.title}`,
         finalTarget: "youtube",
         success: true,
     };

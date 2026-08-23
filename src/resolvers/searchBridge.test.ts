@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { resolveYtmToDeezerBridge, applySourceMasking, extractRequestedSource } from "./searchBridge";
+import { resolveYtmToDeezerBridge, applySourceMasking, extractRequestedSource, buildTargetedQuery } from "./searchBridge";
 import type { LavalinkLoadResult, LavalinkTrack } from "../types";
 
 function createTrack(title: string, author: string, sourceName: string = "deezer", opts: { albumName?: string } = {}): LavalinkTrack {
@@ -32,9 +32,27 @@ describe("Search Bridge Engine (YTM -> Deezer)", () => {
         expect(extractRequestedSource("scsearch:it's raining men")).toBe("soundcloud");
     });
 
-    it("bridges dzsearch query via YTM and resolves authentic Deezer track", async () => {
+    it("builds targeted queries avoiding duplicate artist prefixes", () => {
+        // Adele
+        const adeleTrack = createTrack("Adele - Rolling in the Deep (Official Music Video)", "Adele", "youtube");
+        expect(buildTargetedQuery(adeleTrack)).toBe("Adele - Rolling in the Deep");
+
+        // David Guetta
+        const guettaTrack = createTrack("David Guetta - Hey Mama (Official Video) ft Nicki Minaj, Bebe Rexha & Afrojack", "David Guetta", "youtube");
+        expect(buildTargetedQuery(guettaTrack)).toBe("David Guetta - Hey Mama");
+
+        // Blackstreet
+        const blackstreetTrack = createTrack("Blackstreet - No Diggity (Official Music Video) ft. Dr. Dre, Queen Pen", "Blackstreet", "youtube");
+        expect(buildTargetedQuery(blackstreetTrack)).toBe("Blackstreet - No Diggity");
+
+        // VEVO author channel
+        const vevoTrack = createTrack("Eminem - Lose Yourself (Official Music Video)", "EminemVEVO", "youtube");
+        expect(buildTargetedQuery(vevoTrack)).toBe("Eminem - Lose Yourself");
+    });
+
+    it("bridges dzsearch query via YouTube and resolves authentic Deezer track", async () => {
         const mockUpstream = async (identifier: string): Promise<LavalinkLoadResult | null> => {
-            if (identifier.startsWith("ytmsearch:")) {
+            if (identifier.startsWith("ytsearch:") || identifier.startsWith("ytmsearch:")) {
                 return {
                     loadType: "search",
                     data: [
@@ -63,13 +81,13 @@ describe("Search Bridge Engine (YTM -> Deezer)", () => {
 
         const tracks = bridge.result?.data as LavalinkTrack[];
         expect(tracks[0].info.author).toBe("The Weather Girls");
-        expect(tracks[0].pluginInfo?.bridgedFrom).toBe("ytmsearch:it's raining men");
+        expect(tracks[0].pluginInfo?.bridgedFrom).toBe("ytsearch:it's raining men");
         expect(tracks[0].pluginInfo?.actualSource).toBe("deezer");
     });
 
     it("falls back to YouTube Music if Deezer resolution fails or is empty", async () => {
         const mockUpstream = async (identifier: string): Promise<LavalinkLoadResult | null> => {
-            if (identifier.startsWith("ytmsearch:")) {
+            if (identifier.startsWith("ytsearch:") || identifier.startsWith("ytmsearch:")) {
                 return {
                     loadType: "search",
                     data: [
@@ -113,7 +131,7 @@ describe("Search Bridge Engine (YTM -> Deezer)", () => {
 
     it("re-ranks YTM intermediate pool to pick Elton John over Taron Egerton OST for 'i\\'m still standing'", async () => {
         const mockUpstream = async (identifier: string): Promise<LavalinkLoadResult | null> => {
-            if (identifier.startsWith("ytmsearch:")) {
+            if (identifier.startsWith("ytsearch:") || identifier.startsWith("ytmsearch:")) {
                 // YTM raw list has viral Rocketman OST as index 0, Elton John as index 1
                 return {
                     loadType: "search",
@@ -145,10 +163,10 @@ describe("Search Bridge Engine (YTM -> Deezer)", () => {
     });
 
     it("bridges spsearch query with homophone normalization ('loose yourself' -> Eminem)", async () => {
-        let searchedYtmQuery = "";
+        let searchedYtQuery = "";
         const mockUpstream = async (identifier: string): Promise<LavalinkLoadResult | null> => {
-            if (identifier.startsWith("ytmsearch:")) {
-                searchedYtmQuery = identifier;
+            if (identifier.startsWith("ytsearch:") || identifier.startsWith("ytmsearch:")) {
+                searchedYtQuery = identifier;
                 return {
                     loadType: "search",
                     data: [
@@ -168,7 +186,7 @@ describe("Search Bridge Engine (YTM -> Deezer)", () => {
         };
 
         const bridge = await resolveYtmToDeezerBridge("spsearch:loose yourself", mockUpstream);
-        expect(searchedYtmQuery).toBe("ytmsearch:lose yourself");
+        expect(searchedYtQuery).toBe("ytsearch:lose yourself");
         expect(bridge.success).toBe(true);
         expect(bridge.finalTarget).toBe("deezer");
 
@@ -184,7 +202,7 @@ describe("Search Bridge Engine (YTM -> Deezer)", () => {
 
     it("bridges spsearch:no diggity avoiding Deezer brass band trap", async () => {
         const mockUpstream = async (identifier: string): Promise<LavalinkLoadResult | null> => {
-            if (identifier.startsWith("ytmsearch:")) {
+            if (identifier.startsWith("ytsearch:") || identifier.startsWith("ytmsearch:")) {
                 return {
                     loadType: "search",
                     data: [
